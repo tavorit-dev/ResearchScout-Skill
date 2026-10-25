@@ -1,0 +1,11 @@
+iteration_policy:
+  max_rounds: 8
+  max_branch_depth: 3
+  max_active_branches: 5
+  max_documents_per_round: 50
+  max_documents_per_research: 200
+  max_requests_per_research: 1000
+  max_runtime_minutes: 60
+  min_new_information_ratio: 0.10
+  min_action_priority: 60
+  stop_when_no_progress_rounds: 2
