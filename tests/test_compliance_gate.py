@@ -175,7 +175,9 @@ class TestCompliance(unittest.TestCase):
         self.assertEqual(record["request_rate_limit"], 5.0)
 
     def test_negative_crawl_delay_never_reduces_the_rate_limit(self):
-        # A hostile or broken Crawl-delay must not become a faster crawl.
+        # A hostile or broken Crawl-delay must not become a faster crawl. The
+        # expected value is asserted exactly: a regression that let -5 through
+        # the ">" guard would put -5 in the record and fail here.
         fetcher = fake_fetcher({
             "https://e.org": {"outcome": "ok", "status": 200},
             "https://e.org/robots.txt": {
@@ -186,7 +188,7 @@ class TestCompliance(unittest.TestCase):
             {"source_id": "src_1", "base_url": "https://e.org", "access_method": "web"},
             fetcher=fetcher,
         )
-        self.assertGreaterEqual(record["request_rate_limit"], 0)
+        self.assertEqual(record["request_rate_limit"], 2.0)
 
     def test_record_carries_spec_6_7_fields(self):
         fetcher = fake_fetcher({
@@ -205,3 +207,67 @@ class TestCompliance(unittest.TestCase):
         self.assertEqual(record["terms_status"], "absent")
         self.assertIsInstance(record["allowed_paths"], list)
         self.assertIsInstance(record["notes"], str)
+
+
+class RecordingFetcher:
+    """A fetcher that records the delay each request was issued with."""
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+
+    def __call__(self, url, **kwargs):
+        self.calls.append({"url": url, "delay": kwargs.get("delay")})
+        return self.responses.get(url, {"outcome": "not_found", "status": 404})
+
+    def delays_for(self, url):
+        return [call["delay"] for call in self.calls if call["url"] == url]
+
+
+class TestRequestPacing(unittest.TestCase):
+    def test_crawl_delay_reaches_the_transport(self):
+        # The point of the test is the delay handed to the fetcher, not the
+        # recorded field: a Crawl-delay that is recorded but never applied
+        # leaves the source crawled at the default rate. The reachability
+        # request precedes robots.txt and so necessarily uses the configured
+        # delay; what matters is that the interval for the source is then
+        # re-established at 5s.
+        fetcher = RecordingFetcher({
+            "https://e.org": {"outcome": "ok", "status": 200},
+            "https://e.org/robots.txt": {
+                "outcome": "ok", "status": 200, "text": "User-agent: *\nCrawl-delay: 5\n",
+            },
+        })
+        record = check_compliance(
+            {"source_id": "src_1", "base_url": "https://e.org", "access_method": "web"},
+            fetcher=fetcher,
+        )
+        self.assertEqual(record["request_rate_limit"], 5.0)
+        self.assertEqual(fetcher.delays_for("https://e.org")[-1], 5.0)
+
+    def test_no_crawl_delay_uses_the_configured_delay(self):
+        fetcher = RecordingFetcher({
+            "https://e.org": {"outcome": "ok", "status": 200},
+            "https://e.org/robots.txt": {"outcome": "ok", "status": 200, "text": ""},
+        })
+        check_compliance(
+            {"source_id": "src_1", "base_url": "https://e.org", "access_method": "web"},
+            fetcher=fetcher,
+        )
+        self.assertEqual(fetcher.delays_for("https://e.org"), [2.0])
+        self.assertEqual(fetcher.delays_for("https://e.org/robots.txt"), [2.0])
+
+    def test_crawl_delay_never_lowers_the_configured_delay(self):
+        # A site may not talk us into crawling faster than we chose to.
+        fetcher = RecordingFetcher({
+            "https://e.org": {"outcome": "ok", "status": 200},
+            "https://e.org/robots.txt": {
+                "outcome": "ok", "status": 200, "text": "User-agent: *\nCrawl-delay: 0.5\n",
+            },
+        })
+        record = check_compliance(
+            {"source_id": "src_1", "base_url": "https://e.org", "access_method": "web"},
+            fetcher=fetcher,
+        )
+        self.assertEqual(record["request_rate_limit"], 2.0)
+        self.assertNotIn(0.5, fetcher.delays_for("https://e.org"))
