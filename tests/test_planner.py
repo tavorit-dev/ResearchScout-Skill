@@ -1,4 +1,5 @@
 # tests/test_planner.py
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,6 +36,50 @@ class TestInitResearch(unittest.TestCase):
         loaded = load_research(self.tmp / "security" / "y-topic")
         self.assertEqual(loaded["topic"], "y-topic")
 
+    def test_supplied_lists_without_flag_are_unconfirmed(self):
+        # The path the host agent takes when it backfills its own suggestion:
+        # supplying lists is not the same act as a user confirming them.
+        rec = init_research(
+            self.tmp, domain="security", topic="agent-suggested",
+            objective="o", keywords=["k"], time_window={"recent_days": 30},
+            scope={"core": ["agent security"], "related": [], "excluded": []},
+        )
+        self.assertFalse(rec["scope"]["confirmed"])
+        self.assertEqual(rec["scope"]["core"], ["agent security"])
+
+    def test_explicit_confirmation_survives(self):
+        rec = init_research(
+            self.tmp, domain="security", topic="user-confirmed",
+            objective="o", keywords=["k"], time_window={"recent_days": 30},
+            scope={"core": ["agent security"], "confirmed": True},
+        )
+        self.assertTrue(rec["scope"]["confirmed"])
+        loaded = load_research(self.tmp / "security" / "user-confirmed")
+        self.assertTrue(loaded["scope"]["confirmed"])
+
+    def test_second_init_refuses_and_leaves_project_untouched(self):
+        init_research(
+            self.tmp, domain="security", topic="twice-topic",
+            objective="original", keywords=["k"], time_window={"recent_days": 30},
+            scope={"core": ["a"], "confirmed": True},
+        )
+        root = self.tmp / "security" / "twice-topic"
+        record_before = (root / "research.yaml").read_bytes()
+        scope_before = (root / "state" / "scope.json").read_bytes()
+
+        with self.assertRaises(FileExistsError):
+            init_research(
+                self.tmp, domain="security", topic="twice-topic",
+                objective="overwritten", keywords=["other"],
+                time_window={"recent_days": 7},
+            )
+
+        self.assertEqual((root / "research.yaml").read_bytes(), record_before)
+        self.assertEqual((root / "state" / "scope.json").read_bytes(), scope_before)
+        loaded = load_research(root)
+        self.assertEqual(loaded["objective"], "original")
+        self.assertTrue(loaded["scope"]["confirmed"])
+
 
 class TestSuggestScope(unittest.TestCase):
     def test_suggestion_is_unconfirmed(self):
@@ -43,3 +88,60 @@ class TestSuggestScope(unittest.TestCase):
         self.assertIn("core", scope)
         self.assertIn("related", scope)
         self.assertIn("excluded", scope)
+
+
+class TestLoadResearch(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        init_research(
+            self.tmp, domain="security", topic="read-topic",
+            objective="o", keywords=["k"], time_window={"recent_days": 30},
+        )
+        self.root = self.tmp / "security" / "read-topic"
+
+    def test_research_yaml_is_authoritative_for_scope_lists(self):
+        record = self.root / "research.yaml"
+        record.write_text(
+            record.read_text(encoding="utf-8").replace("  core: []", "  core:\n  - edited"),
+            encoding="utf-8",
+        )
+        loaded = load_research(self.root)
+        self.assertEqual(loaded["scope"]["core"], ["edited"])
+        self.assertFalse(loaded["scope"]["confirmed"])
+
+    def test_sidecar_without_confirmed_reads_as_unconfirmed(self):
+        (self.root / "state" / "scope.json").write_text(
+            json.dumps({"core": ["a"], "related": [], "excluded": []}),
+            encoding="utf-8",
+        )
+        loaded = load_research(self.root)
+        self.assertIs(loaded["scope"]["confirmed"], False)
+
+    def test_malformed_sidecar_is_rejected_with_path(self):
+        (self.root / "state" / "scope.json").write_text("[]", encoding="utf-8")
+        with self.assertRaises(ValueError) as caught:
+            load_research(self.root)
+        self.assertIn("scope.json", str(caught.exception))
+
+    def test_truncated_sidecar_is_rejected_with_path(self):
+        (self.root / "state" / "scope.json").write_text("{", encoding="utf-8")
+        with self.assertRaises(ValueError) as caught:
+            load_research(self.root)
+        self.assertIn("scope.json", str(caught.exception))
+
+    def test_record_failing_its_schema_is_rejected(self):
+        record = self.root / "research.yaml"
+        record.write_text(
+            record.read_text(encoding="utf-8").replace("status: RUNNING", "status: NONSENSE"),
+            encoding="utf-8",
+        )
+        with self.assertRaises(ValueError) as caught:
+            load_research(self.root)
+        self.assertIn("research.yaml", str(caught.exception))
+
+    def test_boolean_recent_days_is_not_a_window(self):
+        rec = init_research(
+            self.tmp, domain="security", topic="bool-topic",
+            objective="o", keywords=["k"], time_window={"recent_days": True},
+        )
+        self.assertEqual(rec["time_window"], {"start": None, "end": None})
