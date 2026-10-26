@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Constructed RSS 2.0 feed used by the collector tests. The host, the
+     entries and the dates are invented for the fixture; this is not a capture
+     of a real feed. The second item deliberately carries no pubDate, so the
+     tests can pin the rule that an unknown date stays unknown (spec 10.2). -->
+<rss version="2.0">
+  <channel>
+    <title>Example Engineering Notes</title>
+    <link>https://e.org</link>
+    <description>Constructed feed for collector tests</description>
+    <item>
+      <title>Agent Sandbox Design</title>
+      <link>https://e.org/a1</link>
+      <pubDate>Mon, 20 Oct 2026 00:00:00 GMT</pubDate>
+      <description>A constructed summary of an agent sandbox design note.</description>
+    </item>
+    <item>
+      <title>Runtime Isolation Notes</title>
+      <link>https://e.org/a2</link>
+      <description>A constructed summary of a runtime isolation note.</description>
+    </item>
+  </channel>
+</rss>
