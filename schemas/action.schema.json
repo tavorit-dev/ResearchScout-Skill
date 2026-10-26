@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://research-scout.local/schemas/action.schema.json",
+  "title": "Action",
+  "description": "A proposed next research action produced by the host agent and validated before it is queued.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "action_id",
+    "type",
+    "topic",
+    "reason",
+    "priority",
+    "time_window_days"
+  ],
+  "properties": {
+    "action_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable id for the action."
+    },
+    "type": {
+      "type": "string",
+      "enum": ["deepen", "broaden", "verify", "backtrack"],
+      "description": "deepen goes deeper into a known thread, broaden opens a new related one, verify checks an existing claim, backtrack revisits an earlier assumption."
+    },
+    "topic": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The subject this action targets."
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Why this action is worth its budget now."
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Scheduling priority, 0-100."
+    },
+    "time_window_days": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "Recency window in days. Null means no window; only verify may use null, and that rule is enforced by the action admission gate, not here."
+    },
+    "scope_justification": {
+      "type": "string",
+      "description": "How this action stays inside the declared core/related scope, or why it belongs in a separate candidate topic."
+    },
+    "expected_benefit": {
+      "type": "string",
+      "description": "What the action is expected to establish."
+    },
+    "target_source_ids": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Sources the action intends to consult; each must already be ALLOWED."
+    },
+    "related_finding_ids": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Findings this action continues, challenges or extends."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "running", "done", "dropped"],
+      "description": "Execution state of the action."
+    },
+    "created_at": {
+      "type": ["string", "null"],
+      "description": "Timestamp when the action was proposed, ISO 8601."
+    },
+    "round_created": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Research round in which the action was proposed."
+    }
+  }
+}
