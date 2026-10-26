@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
+from jsonschema import ValidationError
 
 from scripts.lib.ids import new_id
 from scripts.lib.paths import ensure_research_layout, research_dir
@@ -37,6 +38,11 @@ from scripts.lib.validate import validate_record
 STATUS_RUNNING = "RUNNING"
 
 SCOPE_LISTS = ("core", "related", "excluded")
+
+# ``research.yaml`` holds the record the schemas define; the sidecar holds only
+# the confirmation state, which the schema has no room for.
+RECORD_FILE = "research.yaml"
+SCOPE_FILE = "scope.json"
 
 
 def suggest_scope(objective, keywords):
@@ -73,19 +79,25 @@ def normalize_scope(scope):
     """Return scope with all three lists present, and its confirmation state.
 
     An absent or empty scope is an unconfirmed suggestion built from the seed
-    keywords, never an empty scope treated as confirmed (spec 7.8). A caller
-    that supplies lists is stating them, so those lists count as confirmed
-    unless the caller says otherwise with an explicit ``confirmed`` flag.
+    keywords, never an empty scope treated as confirmed (spec 7.8).
+
+    ``confirmed`` is True only when the caller says so explicitly. It is never
+    inferred from the lists: a host agent backfilling its own semantic
+    suggestion supplies lists too, and that is the very suggestion spec 7.8
+    requires the user to confirm. Reading "lists were supplied" as "a human
+    confirmed them" would make the unconfirmed path -- the common one --
+    impossible to express, so every path defaults to unconfirmed and the
+    confirming call site passes the flag.
     """
     supplied = scope or {}
     if not any(supplied.get(name) for name in SCOPE_LISTS):
         suggested = suggest_scope("", supplied.get("core"))
-        suggested["confirmed"] = bool(supplied.get("confirmed"))
+        suggested["confirmed"] = supplied.get("confirmed") is True
         return suggested
     normalized = {
         name: list(supplied.get(name) or []) for name in SCOPE_LISTS
     }
-    normalized["confirmed"] = bool(supplied.get("confirmed", True))
+    normalized["confirmed"] = supplied.get("confirmed") is True
     return normalized
 
 
@@ -107,8 +119,8 @@ def init_research(archive_root, *, domain, topic, objective, keywords,
     define -- the project's objective, its explicit scope and the period it
     targets. ``state/current.json`` is the same record plus the fields a
     resumed run needs (where the project lives, when it was created, which
-    round it is on), and ``state/scope.json`` holds the scope together with
-    its confirmation state, which the schema has no room for.
+    round it is on), and ``state/scope.json`` holds only the scope
+    confirmation state, which the schema has no room for.
 
     ``research_id`` is an opaque ``res_`` id. The creation date is recorded as
     a field rather than encoded into the id, so the id stays a stable handle
@@ -117,8 +129,23 @@ def init_research(archive_root, *, domain, topic, objective, keywords,
     The returned record is the one callers can act on: it is the validated
     schema record with the scope confirmation state attached, matching what
     ``load_research`` reads back.
+
+    This is a create operation. Initializing a project that already exists
+    raises FileExistsError instead of overwriting it: the archive is a
+    resumable, long-lived project (spec 9.3), so a second call -- a host agent
+    re-running its first-run flow, or a user re-running init -- would mint a
+    new ``research_id`` and reset the objective and the confirmation state
+    while leaving ``documents/``, ``findings/`` and ``iterations/`` in place,
+    orphaning findings under an id that no longer exists. Resuming a project
+    means loading it, not initializing it again.
     """
-    root = ensure_research_layout(research_dir(archive_root, domain, topic))
+    root = research_dir(archive_root, domain, topic)
+    if (root / RECORD_FILE).exists():
+        raise FileExistsError(
+            f"research project already exists: {root}; "
+            f"load it instead of initializing it again"
+        )
+    ensure_research_layout(root)
     resolved = normalize_scope(scope)
     created_at = _utc_now()
 
@@ -134,8 +161,10 @@ def init_research(archive_root, *, domain, topic, objective, keywords,
     }
     validate_record("research", record)
 
-    scope_state = {name: list(resolved[name]) for name in SCOPE_LISTS}
-    scope_state["confirmed"] = resolved["confirmed"]
+    scope_state = {
+        "confirmed": resolved["confirmed"],
+        "lists": {name: list(resolved[name]) for name in SCOPE_LISTS},
+    }
 
     current = dict(record)
     current.update({
@@ -145,38 +174,89 @@ def init_research(archive_root, *, domain, topic, objective, keywords,
         "round": 0,
     })
 
-    (root / "research.yaml").write_text(
+    (root / RECORD_FILE).write_text(
         yaml.safe_dump(record, allow_unicode=True, sort_keys=False),
         encoding="utf-8",
     )
     _write_json(root / "state" / "current.json", current)
-    _write_json(root / "state" / "scope.json", scope_state)
+    _write_json(root / "state" / SCOPE_FILE, scope_state)
 
-    record["scope"] = scope_state
+    record["scope"] = _scope_view(record["scope"], resolved["confirmed"])
     return record
 
 
 def load_research(root):
     """Return the record written by ``init_research`` for a project root.
 
-    The record is read back from ``research.yaml`` so that edits a user makes
-    to it -- correcting a scope, moving a time window -- are what the rest of
-    the Skill sees, not a stale copy. The confirmation state lives beside it
-    in ``state/scope.json`` and is merged back under ``scope``, because a
-    caller reading the scope is the caller that must know whether it may
-    enforce it.
+    ``research.yaml`` is the record, and it is authoritative for all three
+    scope lists: it is the file spec 7.8 says the confirmed scope is written
+    to, and the file the design expects a user to edit, so an edit there has
+    to be what the rest of the Skill sees. Only the confirmation state, which
+    the schema has no room for, is read from ``state/scope.json`` and merged
+    back under ``scope`` -- because a caller reading the scope is the caller
+    that must know whether it may enforce it.
 
-    A file that is missing raises FileNotFoundError naming the path; that is a
-    project that was never initialized or whose archive was moved, and
-    guessing a record from a partial directory would be worse than saying so.
+    Everything read here is checked before it is returned, so a caller can
+    trust the shape. A record that fails ``research.schema.json``, or a
+    sidecar that is not a JSON object, raises ValueError naming the offending
+    path rather than handing back a malformed record the caller will trip over
+    later. A missing file still raises FileNotFoundError, also naming the path.
+
+    A sidecar with no ``confirmed`` key means no confirmation was ever
+    recorded, so the scope reads as unconfirmed. The key is always present in
+    the result and is always a bool: a caller must never be able to read an
+    absent field as permission.
     """
     root = Path(root)
-    record = yaml.safe_load((root / "research.yaml").read_text(encoding="utf-8"))
-    scope_state = json.loads(
-        (root / "state" / "scope.json").read_text(encoding="utf-8")
-    )
-    record["scope"] = scope_state
+    record = _load_record(root / RECORD_FILE)
+    confirmed = _load_confirmed(root / "state" / SCOPE_FILE)
+    record["scope"] = _scope_view(record["scope"], confirmed)
     return record
+
+
+def _scope_view(lists, confirmed):
+    """Return the scope a caller sees: the three lists plus a bool flag."""
+    scope = {name: list(lists.get(name) or []) for name in SCOPE_LISTS}
+    scope["confirmed"] = confirmed is True
+    return scope
+
+
+def _load_record(path):
+    """Read and schema-check ``research.yaml``, naming the path on failure."""
+    try:
+        record = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"cannot read research record {path}: {exc}") from exc
+    try:
+        validate_record("research", record)
+    except ValidationError as exc:
+        raise ValueError(
+            f"research record {path} does not match research.schema.json: {exc.message}"
+        ) from exc
+    return record
+
+
+def _load_confirmed(path):
+    """Return the confirmation flag from the scope sidecar; absent means False.
+
+    A sidecar that cannot be read or parsed, or that is not an object, is a
+    corrupted record rather than an unconfirmed one: treating it as
+    unconfirmed would silently discard a confirmation the user did give, so it
+    raises with the path in the message.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read scope state {path}: {exc}") from exc
+    try:
+        state = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"scope state {path} is not valid JSON: {exc}") from exc
+    if not isinstance(state, dict):
+        raise ValueError(
+            f"scope state {path} must be a JSON object, got {type(state).__name__}"
+        )
+    return state.get("confirmed") is True
 
 
 def _normalize_time_window(time_window):
@@ -188,17 +268,26 @@ def _normalize_time_window(time_window):
     into a real start date: the schema's shape is a boundary the rest of the
     pipeline can compare, and no date is invented -- a missing or unreadable
     window leaves both ends null rather than guessing a period.
+
+    A bool is not a day count even though Python says it is an int, so
+    ``recent_days=True`` leaves the window open rather than silently becoming a
+    one-day window.
     """
     window = time_window or {}
     start = window.get("start")
     end = window.get("end")
     if start is None and end is None:
         recent_days = window.get("recent_days")
-        if isinstance(recent_days, int) and recent_days > 0:
+        if _is_day_count(recent_days):
             now = datetime.now(timezone.utc)
             start = (now - timedelta(days=recent_days)).date().isoformat()
             end = now.date().isoformat()
     return {"start": start, "end": end}
+
+
+def _is_day_count(value):
+    """Return True when value is a usable positive number of days."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _write_json(path, payload):
