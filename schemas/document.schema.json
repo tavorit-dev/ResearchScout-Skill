@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://research-scout.local/schemas/document.schema.json",
+  "title": "Document",
+  "description": "A single collected document and its extraction metadata (spec 9.7). Raw content stays separate: this record carries metadata, scores and a reference to the stored body, never the body itself.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "document_id",
+    "source_id",
+    "canonical_url",
+    "crawl_status",
+    "retention_mode",
+    "attempt_count"
+  ],
+  "properties": {
+    "document_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable id for the document; the traceability anchor for every finding."
+    },
+    "source_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Id of the source this document was collected from."
+    },
+    "source_name": {
+      "type": "string",
+      "description": "Display name of the source at collection time."
+    },
+    "source_url": {
+      "type": "string",
+      "description": "URL of the source landing page, kept for display and traceability."
+    },
+    "title": {
+      "type": "string",
+      "description": "Document title as extracted from the page."
+    },
+    "author": {
+      "type": "string",
+      "description": "Author or publishing organisation when stated."
+    },
+    "published_at": {
+      "type": ["string", "null"],
+      "description": "Publication date as stated by the page, ISO 8601. Null when unknown."
+    },
+    "updated_at": {
+      "type": ["string", "null"],
+      "description": "Date the page was last updated as stated by the page, ISO 8601."
+    },
+    "crawled_at": {
+      "type": ["string", "null"],
+      "description": "Timestamp when the body was fetched, ISO 8601."
+    },
+    "first_seen_at": {
+      "type": ["string", "null"],
+      "description": "Timestamp when the URL was first discovered, ISO 8601."
+    },
+    "canonical_url": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Normalised canonical URL; the dedup key and the original address kept for the reader."
+    },
+    "content_type": {
+      "type": "string",
+      "description": "Media type of the fetched body, for example text/html."
+    },
+    "language": {
+      "type": "string",
+      "description": "Detected language of the body, BCP 47 style tag."
+    },
+    "industry_tags": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Industry tags used for classified archiving and local retrieval."
+    },
+    "topic_tags": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Topic tags used for classified archiving and local retrieval."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Short compliant summary written by the host agent, not a copy of the article."
+    },
+    "key_points": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Key points extracted from this document alone."
+    },
+    "entities": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Named entities mentioned by this document."
+    },
+    "relevance_score": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Topical relevance to the research scope, 0-1."
+    },
+    "authority_score": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Source authority weight, 0-1."
+    },
+    "freshness_score": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Recency weight, 0-1. Affects ordering only, never admission."
+    },
+    "novelty_score": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1,
+      "description": "How much new information this document adds, 0-1."
+    },
+    "content_hash": {
+      "type": "string",
+      "description": "Content fingerprint used for the second dedup layer."
+    },
+    "raw_content_ref": {
+      "type": "string",
+      "description": "Path or reference to the retained body. Absent when retention_mode is reference."
+    },
+    "collection_method": {
+      "type": "string",
+      "description": "How the body was obtained, for example http_get or manual_import."
+    },
+    "compliance_record_id": {
+      "type": "string",
+      "description": "Id of the compliance decision that allowed this collection."
+    },
+    "crawl_status": {
+      "type": "string",
+      "enum": ["DISCOVERED", "QUEUED", "FETCHED", "EXTRACTED", "ANALYZED", "PERSISTED"],
+      "description": "Position in the document state machine. Failures are tracked separately with a reason, retry count and next allowed retry time."
+    },
+    "retention_mode": {
+      "type": "string",
+      "enum": ["reference", "extracted", "full_archive"],
+      "description": "How much of the original is kept. reference keeps only the link and permitted metadata; extracted keeps extracted facts; full_archive keeps the body."
+    },
+    "date_confidence": {
+      "type": "string",
+      "description": "Confidence in the stated dates, so an unknown date is never guessed."
+    },
+    "round_discovered": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Research round in which this document was discovered."
+    },
+    "attempt_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of fetch attempts so far."
+    }
+  }
+}

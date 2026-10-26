@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://research-scout.local/schemas/source.schema.json",
+  "title": "Source",
+  "description": "An information source and its compliance decision. A source is only ever collected from after the compliance gate recorded a decision on it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source_id",
+    "base_url",
+    "compliance_status",
+    "selection_status"
+  ],
+  "properties": {
+    "source_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable id for the source, shared across research projects."
+    },
+    "base_url": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Canonical base URL of the source."
+    },
+    "name": {
+      "type": "string",
+      "description": "Display name of the source."
+    },
+    "domain": {
+      "type": "string",
+      "description": "Research domain this source was discovered for."
+    },
+    "source_type": {
+      "type": "string",
+      "description": "Kind of source, for example official_site, media, paper, report, community."
+    },
+    "compliance_status": {
+      "type": "string",
+      "enum": [
+        "DISCOVERED",
+        "CHECKING",
+        "ALLOWED",
+        "BLOCKED",
+        "REVIEW_REQUIRED",
+        "ERROR",
+        "UNREACHABLE"
+      ],
+      "description": "Outcome of the compliance gate. BLOCKED means policy forbids collection; ERROR means the check failed; UNREACHABLE means robots.txt could not be read, which pauses the source rather than allowing it."
+    },
+    "compliance_record_id": {
+      "type": "string",
+      "description": "Id of the compliance decision record backing compliance_status."
+    },
+    "robots_summary": {
+      "type": "string",
+      "description": "Short human-readable note on what robots.txt allows, for audit."
+    },
+    "terms_summary": {
+      "type": "string",
+      "description": "Short human-readable note on terms or licence restrictions, for audit."
+    },
+    "selection_status": {
+      "type": "string",
+      "enum": ["pending", "selected", "excluded"],
+      "description": "Whether the planner chose this source for the current round."
+    },
+    "selection_reason": {
+      "type": "string",
+      "description": "Why the source was selected or excluded."
+    },
+    "discovery_verified": {
+      "type": "boolean",
+      "description": "True when the source existence and base URL were verified by a real request during discovery."
+    },
+    "discovered_at": {
+      "type": ["string", "null"],
+      "description": "Timestamp when the source was first discovered, ISO 8601."
+    },
+    "last_checked_at": {
+      "type": ["string", "null"],
+      "description": "Timestamp of the last compliance check, ISO 8601."
+    },
+    "last_collected_at": {
+      "type": ["string", "null"],
+      "description": "Timestamp of the last successful collection from this source, ISO 8601."
+    },
+    "reliability_score": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Observed reliability weight, 0-1."
+    },
+    "notes": {
+      "type": "string",
+      "description": "Free-form research notes about this source."
+    }
+  }
+}

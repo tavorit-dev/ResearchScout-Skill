@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://research-scout.local/schemas/research.schema.json",
+  "title": "Research",
+  "description": "A research project: its objective, its explicit scope and its lifecycle status.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "research_id",
+    "domain",
+    "topic",
+    "objective",
+    "keywords",
+    "scope",
+    "time_window",
+    "status"
+  ],
+  "properties": {
+    "research_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable id for the research project."
+    },
+    "domain": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Top-level domain the project is filed under in the archive."
+    },
+    "topic": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The topic being researched."
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What the research must answer; the reference for every action admission check."
+    },
+    "keywords": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string"},
+      "description": "Seed keywords used for source discovery and relevance judgement."
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["core", "related", "excluded"],
+      "description": "Explicit scope. All three lists are required so that what is out of scope is a decision, not an omission.",
+      "properties": {
+        "core": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Subjects the research must cover."
+        },
+        "related": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Adjacent subjects worth following when a source is already being read."
+        },
+        "excluded": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Subjects deliberately left out; they become candidate research topics instead of polluting this archive."
+        }
+      }
+    },
+    "time_window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "description": "The period the research targets. It orders results and drives default action windows; it never disqualifies historical material from the supplementary queue.",
+      "properties": {
+        "start": {
+          "type": ["string", "null"],
+          "description": "Start of the window, ISO 8601 date; null means open-ended."
+        },
+        "end": {
+          "type": ["string", "null"],
+          "description": "End of the window, ISO 8601 date; null means up to now."
+        }
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "RUNNING",
+        "CONTINUE",
+        "DEEPEN",
+        "BROADEN",
+        "VERIFY",
+        "STOP_COMPLETE",
+        "STOP_BUDGET",
+        "STOP_NO_PROGRESS",
+        "PAUSED_REVIEW"
+      ],
+      "description": "Lifecycle of the research loop: RUNNING while active, then one of the loop states."
+    },
+    "language": {
+      "type": "string",
+      "description": "Preferred language of collected material, BCP 47 style tag."
+    },
+    "source_preferences": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Source kinds the planner should prefer, for example official_site or paper."
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Hard limits enforced by the program, not left to the model.",
+      "properties": {
+        "max_rounds": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Maximum number of research rounds."
+        },
+        "max_requests": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Maximum number of HTTP requests."
+        },
+        "max_duration_minutes": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Maximum wall-clock runtime in minutes."
+        }
+      }
+    },
+    "created_at": {
+      "type": ["string", "null"],
+      "description": "Timestamp when the project was created, ISO 8601."
+    },
+    "updated_at": {
+      "type": ["string", "null"],
+      "description": "Timestamp of the last update, ISO 8601."
+    },
+    "current_round": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "The round the loop is currently on, used for resuming."
+    }
+  }
+}
