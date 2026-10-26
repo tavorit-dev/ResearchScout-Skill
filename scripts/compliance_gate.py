@@ -59,8 +59,12 @@ ROOT_PATH = "/"
 def _config_value(config, key, default):
     """Return config[key] when it is set, else default.
 
-    Callers may pass the full loaded config (whose iteration policy lives under
-    ``iteration_policy``) or a flat mapping of transport settings.
+    Callers may pass the full loaded config or a flat mapping of transport
+    settings. The nested lookup under ``iteration_policy`` is defensive: the
+    transport keys live at the top level of ``config/default.yaml``, while
+    ``config/iteration.yaml`` merges under ``iteration_policy``, so the flat
+    branch is the one that normally answers. It is kept so a caller that
+    supplies either shape gets the same limits.
     """
     if not config:
         return default
@@ -117,13 +121,24 @@ def _default_fetcher(url, *, timeout, max_bytes, delay):
     return fetch(url, timeout=timeout, max_bytes=max_bytes, delay=delay)
 
 
-def _check_once(fetcher, url, config):
-    """Request url once with the configured limits."""
+def _configured_delay(config):
+    """Return the request delay configured for a source, before robots.txt."""
+    return _config_value(config, "request_delay_seconds", DEFAULT_DELAY)
+
+
+def _check_once(fetcher, url, config, delay=None):
+    """Request url once with the configured limits.
+
+    ``delay`` overrides the configured request delay. The gate passes the
+    effective pacing for the source here, so that a published Crawl-delay is
+    the interval actually used on the wire and not merely a number in the
+    record.
+    """
     return fetcher(
         url,
         timeout=_config_value(config, "request_timeout_seconds", DEFAULT_TIMEOUT),
         max_bytes=_config_value(config, "max_response_bytes", DEFAULT_MAX_BYTES),
-        delay=_config_value(config, "request_delay_seconds", DEFAULT_DELAY),
+        delay=_configured_delay(config) if delay is None else delay,
     )
 
 
@@ -191,6 +206,16 @@ def check_compliance(source, *, fetcher=None, config=None):
 
     Any robots status this function does not recognise falls to ERROR. The
     gate must not be the place where an unknown answer becomes permission.
+
+    The returned record carries the spec 6.7 check fields only. It omits
+    ``base_url`` and ``selection_status``, which ``schemas/source.schema.json``
+    requires, so the caller must merge the record into the source it was
+    checked for before the result validates as a source record.
+
+    The recorded ``request_rate_limit`` is also applied to this source's
+    requests: when robots.txt publishes a Crawl-delay the gate re-requests the
+    base URL at that interval, so the pacing reaches the transport instead of
+    living only in the record.
     """
     source = source or {}
     fetcher = fetcher or _default_fetcher
@@ -211,9 +236,7 @@ def check_compliance(source, *, fetcher=None, config=None):
         "access_method": access_method,
         "compliance_status": STATUS_UNREACHABLE,
         "allowed_paths": allowed_paths,
-        "request_rate_limit": _config_value(
-            config, "request_delay_seconds", DEFAULT_DELAY
-        ),
+        "request_rate_limit": _configured_delay(config),
         "evidence": evidence,
         "notes": "",
     }
@@ -228,7 +251,8 @@ def check_compliance(source, *, fetcher=None, config=None):
         record["notes"] = "; ".join(notes)
         return record
 
-    # Step 2: robots.txt.
+    # Step 2: robots.txt. The rules are not known yet, so this request uses the
+    # configured delay.
     robots_url = _robots_url(source)
     robots_result = _check_once(fetcher, robots_url, config)
     robots_status, robots_reason = evaluate_robots(robots_result)
@@ -239,12 +263,15 @@ def check_compliance(source, *, fetcher=None, config=None):
     notes.append(f"robots.txt: {robots_reason}")
 
     # A published Crawl-delay raises the pacing for this domain; a missing or
-    # unusable one leaves the configured default in place.
+    # unusable one leaves the configured default in place. The resolved value
+    # is both recorded and applied to the requests the gate makes, so a source
+    # that asks to be crawled slowly is not merely labelled as such.
     rules = parse_robots((robots_result or {}).get("text") or "")
     crawl_delay = rules.crawl_delay()
     if crawl_delay is not None and crawl_delay > record["request_rate_limit"]:
         record["request_rate_limit"] = crawl_delay
         notes.append(f"robots.txt Crawl-delay sets the request interval to {crawl_delay}s")
+    effective_rate_limit = record["request_rate_limit"]
 
     # Step 3: the decision, in the fixed priority order above.
     if robots_status == "error":
@@ -284,6 +311,17 @@ def check_compliance(source, *, fetcher=None, config=None):
                 )
             )
         record["compliance_status"] = terms_decision or STATUS_ALLOWED
+
+    # The resolved pacing is applied, not just recorded. The reachability
+    # request above ran before the rules were known, so when robots.txt asked
+    # for a slower crawl the base URL is requested again at that interval. This
+    # is the request the collector's first fetch is spaced against, and it is
+    # what makes Crawl-delay operative rather than decorative.
+    if effective_rate_limit != _configured_delay(config):
+        _check_once(fetcher, base_url, config, delay=effective_rate_limit)
+        notes.append(
+            f"request interval {effective_rate_limit}s applied to this source's requests"
+        )
 
     record["notes"] = "; ".join(notes)
     return record
