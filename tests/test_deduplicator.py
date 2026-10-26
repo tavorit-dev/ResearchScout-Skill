@@ -44,3 +44,27 @@ class TestDedupe(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         kept, _ = dedupe(docs)
         self.assertEqual(len(kept), 2)
+
+    def test_dedupe_reports_semantic_pair_at_default_threshold(self):
+        # The texts above score 0.899 at the default threshold of 0.9, so the
+        # test before this one never reaches layer 3 through dedupe. These two
+        # differ in real characters -- not whitespace, which layer 2's
+        # fingerprint normalizes away -- and score above the default, so the
+        # pair is produced by dedupe itself. A reported pair and two surviving
+        # documents together are what prove layer 3 does not merge (spec 10.1).
+        docs = [
+            doc("doc_1", "https://a.org/x", "agent sandbox isolation mechanism design for untrusted workloads"),
+            doc("doc_2", "https://b.org/y", "agent sandbox isolation mechanism design for untrusted work"),
+        ]
+        kept, report = dedupe(docs)
+        self.assertEqual(report["semantic_candidates"], [("doc_1", "doc_2")])
+        self.assertEqual(len(kept), 2)
+
+    def test_non_mapping_element_is_kept_not_fatal(self):
+        docs = [
+            doc("doc_1", "https://a.org/x", "first body"),
+            "not a document",
+            doc("doc_2", "https://b.org/y", "second body"),
+        ]
+        kept, _ = dedupe(docs)
+        self.assertEqual(len(kept), 3)

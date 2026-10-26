@@ -79,6 +79,11 @@ def dedupe(documents):
     not have cannot collide with another. A document with no ``text`` takes
     part in layer 1 only, and one that states neither is kept as it stands.
     Layer 3 compares bodies, so a record without one is never suspected.
+
+    An element that is not a mapping is passed through untouched as well. A
+    round must not abort because one candidate was handed over malformed, and
+    a record this module cannot read is not a record it may delete: it is kept
+    for its owner to inspect.
     """
     kept = []
     url_dupes = 0
@@ -87,6 +92,10 @@ def dedupe(documents):
     seen_hashes = set()
 
     for document in documents:
+        if not isinstance(document, dict):
+            kept.append(document)
+            continue
+
         identity = _url_key(document)
         if identity is not None:
             if identity in seen_identities:
@@ -140,10 +149,14 @@ def find_semantic_candidates(documents, threshold=DEFAULT_SIMILARITY_THRESHOLD):
     reported once. A document whose body text is missing or empty, or which
     states no id, is skipped: a pair can only be acted on when both of its
     members can be named in the archive. An empty text would also match every
-    other empty text, turning the report into noise.
+    other empty text, turning the report into noise. An element that is not a
+    mapping is skipped for the same reason it is in ``dedupe`` -- there is no
+    id in it to report.
     """
     comparable = []
     for document in documents:
+        if not isinstance(document, dict):
+            continue
         identifier = _document_id(document)
         text = _document_text(document)
         if identifier and text:
@@ -160,9 +173,26 @@ def find_semantic_candidates(documents, threshold=DEFAULT_SIMILARITY_THRESHOLD):
 def _similarity(left, right):
     """Return how alike two texts are, from 0.0 to 1.0.
 
-    The ratio ``difflib`` computes is twice the number of matching characters
-    over the combined length of both texts, which is 1.0 for identical texts
-    and 0.0 for texts with nothing in common.
+    The score is ``difflib.SequenceMatcher.ratio()``: twice the total size of
+    the *longest* matching blocks, over the combined length of both texts. It
+    is 1.0 for identical texts and 0.0 for texts with nothing in common. It is
+    not a count of every shared character, so a text that merely *contains*
+    another -- a page and a quotation lifted out of it -- scores by how much
+    of the shorter text is covered by one contiguous run, not by the overlap
+    a reader might expect. Two texts that share most of their vocabulary but
+    in a different order score lower still.
+
+    One caveat of the default configuration is worth recording, because the
+    threshold above is compared against this number. ``SequenceMatcher`` runs
+    with ``autojunk=True``, which discards, as "popular", any element that
+    occurs more than once per hundred positions in the second sequence when
+    that sequence is 200 elements or longer. A very common character in a long
+    document is therefore not matchable, and a long pair of near-identical
+    texts does not approach 1.0 the way a short pair does; it can score
+    surprisingly low. That makes layer 3 report *fewer* candidates on long
+    documents, which is the safe direction for a layer that only reports and
+    never merges -- the cost is a suspicion nobody sees, not a document
+    wrongly removed (spec 10.1).
     """
     return SequenceMatcher(None, left, right).ratio()
 
@@ -192,7 +222,8 @@ def _url_key(document):
     """Return the layer-1 key for a document, or ``None`` if it has no URL.
 
     The key is the URL's identity (spec 10.1): two addresses that normalize to
-    the same identity are the same document.
+    the same identity are the same document. A ``canonical_url`` that is
+    missing, empty or not a string yields no key rather than an error.
     """
     url = document.get("canonical_url")
     if not isinstance(url, str) or not url:
