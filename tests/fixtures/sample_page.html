@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<!-- Constructed article page used by the content extractor tests. The site,
+     the author and the dates are invented for the fixture; this is not a
+     capture of a real page. Every element the extractor is expected to strip
+     (nav, header, footer, aside, script, style) and every element it is
+     expected to read (title, h1, meta author, time datetime) appears here so
+     one fixture covers the whole extraction contract. The article body also
+     carries nested inline markup, an HTML entity and a <br>, because the text
+     flattening rules are part of what these tests pin. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Agent Runtime Isolation</title>
+    <meta name="author" content="R. Example">
+    <meta name="description" content="Constructed article page for extractor tests.">
+    <style>
+      article { font-family: sans-serif; }
+    </style>
+    <script>
+      window.analytics = { page: "sample", track: function () {} };
+    </script>
+  </head>
+  <body>
+    <header>
+      <p>Example Engineering Notes</p>
+    </header>
+    <nav>Home | About</nav>
+    <main>
+      <article>
+        <h1>Agent Runtime Isolation</h1>
+        <p class="byline">By R. Example</p>
+        <time datetime="2026-10-20">20 October 2026</time>
+        <p>
+          This constructed note argues that runtime isolation is the part of an
+          agent sandbox that carries the security weight. A tool call the model
+          emits is untrusted input, so the sandbox &mdash; not the prompt &mdash;
+          is what decides which capabilities the call can reach.
+        </p>
+        <p>
+          The note separates three layers: process boundaries,<br>
+          filesystem scope, and network egress. Each layer can be enforced
+          without the model cooperating.
+        </p>
+        <ul>
+          <li>Process boundaries limit what a tool call can <em>crash</em>.</li>
+          <li>Filesystem scope limits what it can read or write.</li>
+          <li>Network egress limits where it can send data.</li>
+        </ul>
+        <blockquote>
+          Isolation is only meaningful if it holds when the model is wrong.
+        </blockquote>
+      </article>
+      <aside>
+        <p>Related reading: a constructed sidebar entry that must be dropped.</p>
+      </aside>
+    </main>
+    <footer>
+      <p>Constructed footer text for extractor tests.</p>
+    </footer>
+  </body>
+</html>
