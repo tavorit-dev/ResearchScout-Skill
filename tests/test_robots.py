@@ -39,7 +39,9 @@ class TestParseRobots(unittest.TestCase):
         self.assertTrue(rules.is_allowed("/anything"))
 
     def test_leading_bom_is_stripped(self):
-        rules = parse_robots("﻿User-agent: *\nDisallow: /secret\n")
+        # chr(0xFEFF) is built here from an integer so that this test does not
+        # share a source of truth with the module's own BOM constant.
+        rules = parse_robots(chr(0xFEFF) + "User-agent: *\nDisallow: /secret\n")
         self.assertFalse(rules.is_allowed("/secret"))
         plain = parse_robots("User-agent: *\nDisallow: /secret\n")
         self.assertFalse(plain.is_allowed("/secret"))
@@ -47,6 +49,13 @@ class TestParseRobots(unittest.TestCase):
     def test_longest_match_wins(self):
         rules = parse_robots("User-agent: *\nDisallow: /a/b/\nAllow: /a/\n")
         self.assertFalse(rules.is_allowed("/a/b/c"))
+
+    def test_longer_allow_rule_overrides_shorter_disallow(self):
+        # Only the longer Allow rule can permit this path, so the test fails
+        # under plain "Disallow wins" logic.
+        rules = parse_robots("User-agent: *\nDisallow: /a/\nAllow: /a/b/\n")
+        self.assertTrue(rules.is_allowed("/a/b/c"))
+        self.assertFalse(rules.is_allowed("/a/other"))
 
     def test_equal_length_tie_goes_to_allow_either_order(self):
         allow_first = parse_robots("User-agent: *\nAllow: /x/\nDisallow: /x/\n")
