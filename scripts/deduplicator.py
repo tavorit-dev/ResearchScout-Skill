@@ -75,9 +75,10 @@ def dedupe(documents):
       ``kept`` (spec 10.1).
 
     The counts are records removed, not records seen. A document that states no
-    ``canonical_url`` takes part in layers 2 and 3 only, because an address it
-    does not have cannot collide with another; a document with no ``text``
-    takes part in layers 1 and 3 only, on the same reasoning.
+    ``canonical_url`` takes part in layer 2 only, because an address it does
+    not have cannot collide with another. A document with no ``text`` takes
+    part in layer 1 only, and one that states neither is kept as it stands.
+    Layer 3 compares bodies, so a record without one is never suspected.
     """
     kept = []
     url_dupes = 0
@@ -141,15 +142,16 @@ def find_semantic_candidates(documents, threshold=DEFAULT_SIMILARITY_THRESHOLD):
     members can be named in the archive. An empty text would also match every
     other empty text, turning the report into noise.
     """
-    comparable = [
-        (index, _document_id(document), _document_text(document))
-        for index, document in enumerate(documents)
-        if _document_id(document) and _document_text(document)
-    ]
+    comparable = []
+    for document in documents:
+        identifier = _document_id(document)
+        text = _document_text(document)
+        if identifier and text:
+            comparable.append((identifier, text))
 
     candidates = []
-    for position, (left_index, left_id, left_text) in enumerate(comparable):
-        for right_index, right_id, right_text in comparable[position + 1:]:
+    for position, (left_id, left_text) in enumerate(comparable):
+        for right_id, right_text in comparable[position + 1:]:
             if _similarity(left_text, right_text) >= threshold:
                 candidates.append((left_id, right_id))
     return candidates
