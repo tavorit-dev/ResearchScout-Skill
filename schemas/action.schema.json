@@ -48,34 +48,6 @@
     "scope_justification": {
       "type": "string",
       "description": "How this action stays inside the declared core/related scope, or why it belongs in a separate candidate topic."
-    },
-    "expected_benefit": {
-      "type": "string",
-      "description": "What the action is expected to establish."
-    },
-    "target_source_ids": {
-      "type": "array",
-      "items": {"type": "string"},
-      "description": "Sources the action intends to consult; each must already be ALLOWED."
-    },
-    "related_finding_ids": {
-      "type": "array",
-      "items": {"type": "string"},
-      "description": "Findings this action continues, challenges or extends."
-    },
-    "status": {
-      "type": "string",
-      "enum": ["pending", "running", "done", "dropped"],
-      "description": "Execution state of the action."
-    },
-    "created_at": {
-      "type": ["string", "null"],
-      "description": "Timestamp when the action was proposed, ISO 8601."
-    },
-    "round_created": {
-      "type": ["integer", "null"],
-      "minimum": 0,
-      "description": "Research round in which the action was proposed."
     }
   }
 }

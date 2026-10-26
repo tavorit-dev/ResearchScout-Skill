@@ -49,3 +49,29 @@ class TestSchemas(unittest.TestCase):
                 "finding_id": "find_1", "statement": "s", "confidence": 0.5,
                 "importance": 0.5, "evidence": [],
             })
+
+    def test_source_accepts_candidate_shape(self):
+        validate_record("source", {
+            "source_id": "src_1", "source_name": "blog.example.org",
+            "base_url": "https://blog.example.org", "discovery_method": "manual",
+            "discovery_verified": True, "compliance_status": "DISCOVERED",
+            "selection_status": "pending",
+        })
+
+    def test_source_accepts_compliance_record_shape(self):
+        validate_record("source", {
+            "source_id": "src_1", "domain": "e.org", "base_url": "https://e.org",
+            "checked_at": "2026-01-01T00:00:00Z", "robots_status": "ok", "terms_status": "absent", "access_method": "web",
+            "compliance_status": "ALLOWED", "allowed_paths": ["/feed"],
+            "request_rate_limit": 1.0,
+            "evidence": [{"type": "robots_txt", "url": "https://e.org/robots.txt", "detail": "no rules"}],
+            "notes": "", "selection_status": "selected",
+        })
+
+    def test_source_rejects_unknown_field(self):
+        with self.assertRaises(ValidationError):
+            validate_record("source", {
+                "source_id": "src_1", "base_url": "https://e.org",
+                "compliance_status": "DISCOVERED", "selection_status": "pending",
+                "surprise": 1,
+            })

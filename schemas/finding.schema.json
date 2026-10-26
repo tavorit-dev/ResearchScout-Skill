@@ -86,24 +86,6 @@
       "minimum": 0,
       "maximum": 1,
       "description": "Ranking weight derived from the scoring dimensions, 0-1. Used for ordering only; it is not the confidence in the statement."
-    },
-    "status": {
-      "type": "string",
-      "enum": ["active", "revised", "retracted", "superseded"],
-      "description": "Lifecycle of the finding; earlier versions are kept when a finding is revised."
-    },
-    "revision_of": {
-      "type": "string",
-      "description": "finding_id of the earlier finding this one corrects."
-    },
-    "round_created": {
-      "type": ["integer", "null"],
-      "minimum": 0,
-      "description": "Research round in which the finding was first recorded."
-    },
-    "updated_at": {
-      "type": ["string", "null"],
-      "description": "Timestamp of the last revision, ISO 8601."
     }
   }
 }
