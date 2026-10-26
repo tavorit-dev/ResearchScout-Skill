@@ -27,6 +27,7 @@ that it comes from model knowledge and is unverified.
 from urllib.parse import urlsplit
 
 from scripts.lib.ids import new_id
+from scripts.lib.urlnorm import DEFAULT_PORTS
 
 # Candidate-source defaults (spec 8.5).
 STATUS_DISCOVERED = "DISCOVERED"
@@ -41,22 +42,33 @@ DEFAULT_LIMIT = 20
 
 
 def _base_url_of(url):
-    """Return scheme + host of url, or "" when there is no usable host.
+    """Return scheme + host of url, or "" when url is unusable.
 
     The base URL is the unit a source is identified and deduplicated by, so
     the path, query and fragment of a discovered address are dropped here.
+    Malformed input returns "" rather than raising, because the input to this
+    module is not trusted: a discovered address may be user-pasted or, on the
+    model-reported path, invented. An address that cannot be read yields no
+    candidate instead of an exception.
+
+    A default port is dropped and a non-default one is kept, reusing the
+    definition in ``urlnorm`` so the two modules cannot drift: the base URL is
+    the identity unit, so ``https://e.org:443/a`` and ``https://e.org/b`` must
+    be one source, while a service on another port is a different source.
     """
     try:
         parts = urlsplit(url or "")
         host = parts.hostname or ""
+        port = parts.port
     except ValueError:
         return ""
     if not parts.scheme or not host:
         return ""
+    scheme = parts.scheme.lower()
     netloc = host
-    if parts.port is not None:
-        netloc = f"{host}:{parts.port}"
-    return f"{parts.scheme.lower()}://{netloc}"
+    if port is not None and str(port) != DEFAULT_PORTS.get(scheme):
+        netloc = f"{host}:{port}"
+    return f"{scheme}://{netloc}"
 
 
 def _candidate(source_id, base_url, source_name, discovery_method, discovery_verified):
@@ -81,8 +93,29 @@ def _candidate(source_id, base_url, source_name, discovery_method, discovery_ver
     }
 
 
+def _apply_limit(candidates, limit):
+    """Return at most ``limit`` candidates, applied after deduplication.
+
+    ``None`` means the caller did not state a cap, and is read as the default
+    cap rather than as "no cap": ``None`` is the accidental value in this
+    codebase (``config/default.yaml`` carries ``search_provider: null``), and
+    an accidentally unbounded candidate list is the wrong way to fail on a
+    path that feeds the compliance gate. A non-positive limit asks for no
+    candidates and gets none.
+    """
+    if limit is None:
+        limit = DEFAULT_LIMIT
+    if limit <= 0:
+        return []
+    return candidates[:limit]
+
+
 def _dedupe_by_base_url(candidates):
-    """Keep the first candidate seen for each base URL, preserving order."""
+    """Keep the first candidate seen for each base URL, preserving order.
+
+    Deduplication runs before the cap, so a caller asking for N candidates
+    gets N distinct sources rather than N raw entries that collapse to fewer.
+    """
     seen = set()
     kept = []
     for candidate in candidates:
@@ -94,7 +127,7 @@ def _dedupe_by_base_url(candidates):
     return kept
 
 
-def manual_provider(urls, **_):
+def manual_provider(urls, *, limit=None, **_):
     """Build candidates from URLs the user supplied directly.
 
     The scheme and host become ``base_url`` and the host becomes
@@ -123,10 +156,10 @@ def manual_provider(urls, **_):
                 True,
             )
         )
-    return _dedupe_by_base_url(candidates)
+    return _apply_limit(_dedupe_by_base_url(candidates), limit)
 
 
-def llm_provider(candidates, **_):
+def llm_provider(candidates, *, limit=None, **_):
     """Build candidates the host agent reported from model knowledge.
 
     The script cannot call a model, so the candidates arrive already formed and
@@ -142,7 +175,10 @@ def llm_provider(candidates, **_):
     built = []
     for candidate in candidates or []:
         candidate = candidate or {}
-        base_url = candidate.get("base_url") or ""
+        # The base URL is read through the same parser as the manual path, so
+        # a candidate whose address cannot be parsed -- an unreadable port, for
+        # one -- is skipped here too rather than raising on model output.
+        base_url = _base_url_of(candidate.get("base_url"))
         if not base_url:
             continue
         entry = _candidate(
@@ -156,7 +192,7 @@ def llm_provider(candidates, **_):
             if candidate.get(field) is not None:
                 entry[field] = candidate[field]
         built.append(entry)
-    return _dedupe_by_base_url(built)
+    return _apply_limit(_dedupe_by_base_url(built), limit)
 
 
 # The providers this version implements. Third-party search backends are
@@ -179,7 +215,9 @@ def discover(query, *, provider, payload=None, limit=20):
     ``query`` states what is being researched and is the argument a real search
     backend would use; the providers implemented in v1 take their candidates
     from ``payload`` (URLs, or candidate dicts) instead, so they accept the
-    query and ignore it. ``limit`` caps the number of candidates returned.
+    query and ignore it. ``limit`` caps the number of candidates returned and
+    is forwarded to the provider, which applies it after deduplication, so a
+    caller asking for 20 gets 20 distinct sources.
 
     The result is a candidate list, not a work queue: nothing is fetched and
     nothing is collected here.
@@ -189,5 +227,4 @@ def discover(query, *, provider, payload=None, limit=20):
             f"unknown search provider: {provider!r}; "
             f"known providers: {sorted(PROVIDERS)}"
         )
-    candidates = PROVIDERS[provider](payload)
-    return candidates[:limit]
+    return PROVIDERS[provider](payload, limit=limit)
