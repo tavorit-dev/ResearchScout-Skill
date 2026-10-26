@@ -24,6 +24,15 @@ caller that owns them:
   ``ftp://`` address can arrive here as a source with ``access_method`` of
   ``web``. Such an address is never handed to ``fetch``.
 
+Known v1 limitation, accepted rather than fixed here: the redirect re-check
+compares hosts, it does not re-consult robots.txt for the redirected path. A
+redirect from a permitted address to a robots-disallowed path on the *same*
+host is therefore collected. Re-consulting the gate per URL mid-collection
+would invert the stage separation (spec 8.6) and repeat a check the research
+loop already performs per source. The host check is what closes the path that
+actually mattered -- content from a host no gate ever checked entering the
+archive.
+
 Retention is chosen deliberately, never defaulted to keeping the body (spec
 9.6): documents leave here at ``retention_mode`` of ``reference``, carrying the
 link, the metadata the feed itself supplied, and a hash -- not the article.
@@ -147,10 +156,20 @@ def assert_compliance_allows(source):
 
 
 def _text(element):
-    """Return the stripped text of element, or an empty string."""
-    if element is None or element.text is None:
+    """Return all the text inside element, stripped, or an empty string.
+
+    The text of an element is not only its own ``.text``: XML allows mixed
+    content, so ``<title>Nested <b>Title</b> Here</title>`` holds "Nested",
+    "Title" and " Here" across the element and its children. Reading only
+    ``.text`` would silently truncate that title to "Nested", which would then
+    corrupt both the document record and its content fingerprint. Gathering
+    every text node with ``itertext()`` gives the same answer for plain text,
+    mixed content, CDATA and character entities alike, so there is one rule
+    rather than a primary path and a fallback that disagree.
+    """
+    if element is None:
         return ""
-    return element.text.strip()
+    return "".join(element.itertext()).strip()
 
 
 def _localname(tag):
@@ -277,18 +296,17 @@ def _summary_of(entry):
 
 
 def _entry_title(entry):
-    """Return the entry title, tolerating Atom's nested title markup.
+    """Return the entry title, including any markup nested inside it.
 
-    An Atom title may hold child markup, in which case the element's own text
-    is empty and the text is gathered from its children instead.
+    Atom permits mixed content in a title, so the title is the concatenation of
+    every text node in the element rather than only the leading one (see
+    ``_text``). There is a single rule here rather than a preferred path and a
+    fallback, because two paths that disagree are how a title gets truncated.
     """
     for title in _children(entry, "title"):
         text = _text(title)
         if text:
             return text
-        joined = "".join(title.itertext()).strip()
-        if joined:
-            return joined
     return ""
 
 
