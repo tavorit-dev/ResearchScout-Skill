@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://research-scout.local/schemas/source.schema.json",
   "title": "Source",
-  "description": "An information source and its compliance decision. A source is only ever collected from after the compliance gate recorded a decision on it.",
+  "description": "An information source and its compliance decision. The record carries both the candidate-source fields of spec 8.5 (what discovery produces) and the compliance-record fields of spec 6.7 (what the compliance gate produces), because the gate's output is consumed directly as a source record. A source is only ever collected from after the gate recorded ALLOWED.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -17,22 +17,48 @@
       "minLength": 1,
       "description": "Stable id for the source, shared across research projects."
     },
+    "source_name": {
+      "type": "string",
+      "description": "Display name of the source, for example the host of the base URL."
+    },
     "base_url": {
       "type": "string",
       "minLength": 1,
       "description": "Canonical base URL of the source."
     },
-    "name": {
-      "type": "string",
-      "description": "Display name of the source."
-    },
-    "domain": {
-      "type": "string",
-      "description": "Research domain this source was discovered for."
-    },
     "source_type": {
       "type": "string",
       "description": "Kind of source, for example official_site, media, paper, report, community."
+    },
+    "industry_tags": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Industry tags used for classified archiving and local retrieval."
+    },
+    "topic_tags": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Topic tags used for classified archiving and local retrieval."
+    },
+    "authority_level": {
+      "type": "string",
+      "description": "Assessed authority of the source, for example primary, established, secondary, unknown."
+    },
+    "discovery_method": {
+      "type": "string",
+      "description": "How the source was found, for example manual or llm. Sources proposed by the model stay unverified until a real request confirms them."
+    },
+    "discovery_verified": {
+      "type": "boolean",
+      "description": "True only when the source existence and base URL were confirmed by a real request during discovery."
+    },
+    "robots_url": {
+      "type": "string",
+      "description": "URL of the robots.txt consulted for this source."
+    },
+    "terms_url": {
+      "type": "string",
+      "description": "URL of the terms or licence page. When present, v1 parks the source at REVIEW_REQUIRED."
     },
     "compliance_status": {
       "type": "string",
@@ -47,52 +73,75 @@
       ],
       "description": "Outcome of the compliance gate. BLOCKED means policy forbids collection; ERROR means the check failed; UNREACHABLE means robots.txt could not be read, which pauses the source rather than allowing it."
     },
-    "compliance_record_id": {
-      "type": "string",
-      "description": "Id of the compliance decision record backing compliance_status."
+    "allowed_paths": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Path prefixes the gate permits collecting from. The collector must not go outside them."
     },
-    "robots_summary": {
+    "access_method": {
       "type": "string",
-      "description": "Short human-readable note on what robots.txt allows, for audit."
+      "description": "How the source is read, for example web, rss or api."
     },
-    "terms_summary": {
-      "type": "string",
-      "description": "Short human-readable note on terms or licence restrictions, for audit."
+    "last_checked_at": {
+      "type": ["string", "null"],
+      "description": "Timestamp of the last compliance check, ISO 8601."
     },
     "selection_status": {
       "type": "string",
       "enum": ["pending", "selected", "excluded"],
       "description": "Whether the planner chose this source for the current round."
     },
-    "selection_reason": {
+    "domain": {
       "type": "string",
-      "description": "Why the source was selected or excluded."
+      "description": "Domain the source belongs to; the unit the request rate limit is applied to."
     },
-    "discovery_verified": {
-      "type": "boolean",
-      "description": "True when the source existence and base URL were verified by a real request during discovery."
-    },
-    "discovered_at": {
+    "checked_at": {
       "type": ["string", "null"],
-      "description": "Timestamp when the source was first discovered, ISO 8601."
+      "description": "Timestamp when the compliance record was assembled, ISO 8601."
     },
-    "last_checked_at": {
-      "type": ["string", "null"],
-      "description": "Timestamp of the last compliance check, ISO 8601."
+    "robots_status": {
+      "type": "string",
+      "description": "Robots outcome, for example ok, absent, blocked or error."
     },
-    "last_collected_at": {
-      "type": ["string", "null"],
-      "description": "Timestamp of the last successful collection from this source, ISO 8601."
+    "terms_status": {
+      "type": "string",
+      "description": "Terms outcome, for example absent, present or unknown."
     },
-    "reliability_score": {
+    "request_rate_limit": {
       "type": ["number", "null"],
       "minimum": 0,
-      "maximum": 1,
-      "description": "Observed reliability weight, 0-1."
+      "description": "Minimum seconds between requests to this domain."
+    },
+    "evidence": {
+      "type": "array",
+      "description": "What the compliance decision was based on, so it can be audited later.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Kind of evidence, for example robots_txt or terms_page."
+          },
+          "url": {
+            "type": "string",
+            "description": "URL the evidence was read from."
+          },
+          "detail": {
+            "type": "string",
+            "description": "What was found, for example the matching Disallow rule."
+          },
+          "note": {
+            "type": "string",
+            "description": "Short human-readable note on how the evidence drove the decision."
+          }
+        }
+      }
     },
     "notes": {
       "type": "string",
-      "description": "Free-form research notes about this source."
+      "description": "Free-form research or compliance notes about this source."
     }
   }
 }

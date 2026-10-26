@@ -95,50 +95,6 @@
         "PAUSED_REVIEW"
       ],
       "description": "Lifecycle of the research loop: RUNNING while active, then one of the loop states."
-    },
-    "language": {
-      "type": "string",
-      "description": "Preferred language of collected material, BCP 47 style tag."
-    },
-    "source_preferences": {
-      "type": "array",
-      "items": {"type": "string"},
-      "description": "Source kinds the planner should prefer, for example official_site or paper."
-    },
-    "budget": {
-      "type": "object",
-      "additionalProperties": false,
-      "description": "Hard limits enforced by the program, not left to the model.",
-      "properties": {
-        "max_rounds": {
-          "type": ["integer", "null"],
-          "minimum": 1,
-          "description": "Maximum number of research rounds."
-        },
-        "max_requests": {
-          "type": ["integer", "null"],
-          "minimum": 1,
-          "description": "Maximum number of HTTP requests."
-        },
-        "max_duration_minutes": {
-          "type": ["integer", "null"],
-          "minimum": 1,
-          "description": "Maximum wall-clock runtime in minutes."
-        }
-      }
-    },
-    "created_at": {
-      "type": ["string", "null"],
-      "description": "Timestamp when the project was created, ISO 8601."
-    },
-    "updated_at": {
-      "type": ["string", "null"],
-      "description": "Timestamp of the last update, ISO 8601."
-    },
-    "current_round": {
-      "type": ["integer", "null"],
-      "minimum": 0,
-      "description": "The round the loop is currently on, used for resuming."
     }
   }
 }
