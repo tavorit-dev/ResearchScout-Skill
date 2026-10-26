@@ -22,6 +22,9 @@ STATUS_BLOCKED = "blocked"
 STATUS_ERROR = "error"
 STATUS_ABSENT = "absent"
 
+# A leading byte order mark is not whitespace and would hide the first line.
+BOM = "﻿"
+
 # A group starts with one or more User-agent lines followed by rules.
 USER_AGENT_RE = re.compile(r"^user-agent\s*:\s*(.*)$", re.IGNORECASE)
 DISALLOW_RE = re.compile(r"^disallow\s*:\s*(.*)$", re.IGNORECASE)
@@ -106,11 +109,15 @@ def parse_robots(text):
     Lines are grouped by User-agent; consecutive User-agent lines share one
     group. Unknown directives, comments and blank lines are ignored. Paths
     are compared by prefix, as RFC 9309 specifies.
+
+    A leading byte order mark is removed first (RFC 9309 section 2.2.2). It is
+    not whitespace, so it would otherwise hide the first directive from the
+    regexes and silently discard the rules that follow.
     """
     groups = {}
     agents = []
     group = None
-    for raw_line in (text or "").splitlines():
+    for raw_line in (text or "").lstrip(BOM).splitlines():
         line = raw_line.split("#", 1)[0].strip()
         if not line:
             continue
