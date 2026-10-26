@@ -38,8 +38,35 @@ class TestParseRobots(unittest.TestCase):
         rules = parse_robots("")
         self.assertTrue(rules.is_allowed("/anything"))
 
+    def test_leading_bom_is_stripped(self):
+        rules = parse_robots("﻿User-agent: *\nDisallow: /secret\n")
+        self.assertFalse(rules.is_allowed("/secret"))
+        plain = parse_robots("User-agent: *\nDisallow: /secret\n")
+        self.assertFalse(plain.is_allowed("/secret"))
+
+    def test_longest_match_wins(self):
+        rules = parse_robots("User-agent: *\nDisallow: /a/b/\nAllow: /a/\n")
+        self.assertFalse(rules.is_allowed("/a/b/c"))
+
+    def test_equal_length_tie_goes_to_allow_either_order(self):
+        allow_first = parse_robots("User-agent: *\nAllow: /x/\nDisallow: /x/\n")
+        self.assertTrue(allow_first.is_allowed("/x/y"))
+        disallow_first = parse_robots("User-agent: *\nDisallow: /x/\nAllow: /x/\n")
+        self.assertTrue(disallow_first.is_allowed("/x/y"))
+
+    def test_specific_agent_group_overrides_wildcard(self):
+        rules = parse_robots(
+            "User-agent: *\nDisallow: /\n\nUser-agent: GoodBot\nAllow: /\n"
+        )
+        self.assertTrue(rules.is_allowed("/blog", user_agent="GoodBot"))
+        self.assertFalse(rules.is_allowed("/blog", user_agent="OtherBot"))
+
 
 class TestEvaluateRobots(unittest.TestCase):
+    def test_unknown_outcome_fails_closed(self):
+        status, _ = evaluate_robots({"outcome": "something_new"})
+        self.assertEqual(status, "error")
+
     def test_server_error_is_error_not_allowed(self):
         status, reason = evaluate_robots({"outcome": "server_error", "status": 503})
         self.assertEqual(status, "error")
