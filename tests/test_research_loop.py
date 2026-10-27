@@ -1019,6 +1019,84 @@ class TestCrossRoundDedup(TempCase):
         self.assertEqual(second["new_documents"], [])
 
 
+class TestDocumentTexts(TempCase):
+    """The handoff carries analysis text for this round's new documents only.
+
+    Reference mode keeps metadata, not the body, so the host needs the text it
+    may analyse in the handoff. The text is transient: it is not a document
+    field and is never persisted.
+    """
+
+    def test_a_web_page_round_carries_the_extracted_text(self):
+        root = layout_root(self.tmp)
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=text_fetcher(PAGE),
+            sources=[source(source_id="src_page", access_method="web",
+                            feed_url="", base_url="https://e.org")],
+        )
+
+        document = handoff["new_documents"][0]
+        self.assertEqual(
+            handoff["document_texts"],
+            {document["document_id"]:
+             "Runtime isolation keeps agent tools in a sandbox."},
+        )
+
+    def test_a_feed_round_carries_the_entry_summary(self):
+        root = layout_root(self.tmp)
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=text_fetcher(FEED_ONE), sources=[source()],
+        )
+
+        document = handoff["new_documents"][0]
+        self.assertEqual(
+            handoff["document_texts"],
+            {document["document_id"]: "Runtime isolation for agent tools."},
+        )
+
+    def test_a_deduplicated_document_carries_no_text(self):
+        root = layout_root(self.tmp)
+        config = {"iteration_policy": {}}
+
+        run_round(root, round_no=1, actions=[], config=config,
+                  fetcher=text_fetcher(FEED_ONE), sources=[source()])
+        second = run_round(root, round_no=2, actions=[], config=config,
+                           fetcher=text_fetcher(FEED_ONE), sources=[source()])
+
+        self.assertEqual(second["new_documents"], [])
+        self.assertEqual(second["document_texts"], {})
+
+    def test_the_persisted_page_record_has_no_text_field(self):
+        root = layout_root(self.tmp)
+        run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=text_fetcher(PAGE),
+            sources=[source(source_id="src_page", access_method="web",
+                            feed_url="", base_url="https://e.org")],
+        )
+
+        stored = read_records(root / "documents" / "documents.jsonl")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["retention_mode"], "reference")
+        self.assertNotIn("text", stored[0])
+        self.assertNotIn("document_texts", stored[0])
+        validate_record("document", stored[0])
+
+    def test_apply_does_not_write_the_transient_text(self):
+        root = layout_root(self.tmp)
+        apply(
+            root, findings=[],
+            handoff={"round": 1, "new_documents": [],
+                     "document_texts": {"doc_example": "untrusted page text"}},
+        )
+
+        iteration = (root / "iterations" / "round-001.json").read_text("utf-8")
+        self.assertNotIn("document_texts", iteration)
+        self.assertNotIn("untrusted page text", iteration)
+
+
 class TestRoundLimit(TempCase):
     def test_a_round_beyond_max_rounds_does_not_collect(self):
         root = layout_root(self.tmp)
@@ -1812,16 +1890,19 @@ class TestCli(TempCase):
             "selection_status": "pending",
         }]), encoding="utf-8")
 
-        code, out, _ = self.run_main([
-            "--root", str(root), "--round", "1",
-            "--sources", str(sources_path),
-        ])
+        with mock.patch("scripts.research_loop._default_fetcher") as default_fetcher:
+            code, out, _ = self.run_main([
+                "--root", str(root), "--round", "1",
+                "--sources", str(sources_path),
+            ])
 
         self.assertEqual(code, 0)
+        default_fetcher.assert_not_called()
         handoff = json.loads(out)
         self.assertEqual(handoff["round"], 1)
         self.assertEqual(len(handoff["candidates_for_review"]), 1)
         self.assertEqual(handoff["new_documents"], [])
+        self.assertEqual(handoff["document_texts"], {})
 
     def test_round_passes_actions_and_sources(self):
         root = project(self.tmp, scope=CONFIRMED_SCOPE)
@@ -1836,12 +1917,14 @@ class TestCli(TempCase):
             "selection_status": "pending",
         }]), encoding="utf-8")
 
-        code, out, _ = self.run_main([
-            "--root", str(root), "--round", "1",
-            "--actions", str(actions_path), "--sources", str(sources_path),
-        ])
+        with mock.patch("scripts.research_loop._default_fetcher") as default_fetcher:
+            code, out, _ = self.run_main([
+                "--root", str(root), "--round", "1",
+                "--actions", str(actions_path), "--sources", str(sources_path),
+            ])
 
         self.assertEqual(code, 0)
+        default_fetcher.assert_not_called()
         handoff = json.loads(out)
         self.assertEqual(len(handoff["candidates_for_review"]), 1)
         pending = json.loads(
@@ -1855,6 +1938,22 @@ class TestCli(TempCase):
         with self.assertRaises(SystemExit) as caught:
             with redirect_stderr(io.StringIO()):
                 main(["--root", str(root), "--round", "1"])
+        self.assertNotEqual(caught.exception.code, 0)
+
+    def test_sources_cannot_be_combined_with_apply(self):
+        root = layout_root(self.tmp)
+        with self.assertRaises(SystemExit) as caught:
+            with redirect_stderr(io.StringIO()):
+                main(["--root", str(root),
+                      "--apply", str(self.tmp / "results.json"),
+                      "--sources", str(self.tmp / "sources.json")])
+        self.assertNotEqual(caught.exception.code, 0)
+
+    def test_sources_cannot_be_combined_with_check_env(self):
+        with self.assertRaises(SystemExit) as caught:
+            with redirect_stderr(io.StringIO()):
+                main(["--check-env", "--sources",
+                      str(self.tmp / "sources.json")])
         self.assertNotEqual(caught.exception.code, 0)
 
     def test_apply_prints_a_json_result(self):
