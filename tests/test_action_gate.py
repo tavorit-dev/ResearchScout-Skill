@@ -1,6 +1,6 @@
 # tests/test_action_gate.py
 import unittest
-from scripts.action_gate import evaluate_action, check_scope
+from scripts.action_gate import evaluate_action, check_scope, scope_list_of
 
 SCOPE = {
     "core": ["Agent 工具调用安全", "Agent 权限控制"],
@@ -323,7 +323,12 @@ class TestResultShape(unittest.TestCase):
     def test_accepted_result_has_empty_rejection(self):
         result = evaluate_action(action(), scope=SCOPE,
                                  budget={"remaining_documents": 100}, seen_topics=[])
-        self.assertEqual(set(result), {"accepted", "reason", "rejected_as"})
+        # ``scope_list`` was added by Task 16 ruling 4 so downstream code can
+        # tell a candidate LEAD (related) from a candidate research TOPIC
+        # (excluded/none) without parsing ``reason``. This is the one existing
+        # assertion the new key necessarily changes; the plan's 11 verbatim
+        # tests do not inspect the key set.
+        self.assertEqual(set(result), {"accepted", "reason", "rejected_as", "scope_list"})
         self.assertIs(result["accepted"], True)
         self.assertIsNone(result["rejected_as"])
         self.assertTrue(result["reason"])
@@ -498,6 +503,107 @@ class TestNonMappingArguments(unittest.TestCase):
                                  seen_topics=[])
         self.assertFalse(result["accepted"])
         self.assertEqual(result["rejected_as"], "unconfirmed_scope")
+
+
+class TestScopeListOf(unittest.TestCase):
+    """``scope_list_of`` names which list decided, as data.
+
+    ``rejected_as == "candidate_topic"`` collapses three outcomes that spec 7.8
+    keeps apart: an ``excluded`` topic and a topic in no list are candidate
+    research TOPICS, while a ``related`` topic missing its justification is a
+    candidate LEAD. Downstream code must not recover that distinction by
+    parsing the English ``reason``.
+    """
+
+    def test_core_member(self):
+        self.assertEqual(scope_list_of(action(), SCOPE), "core")
+
+    def test_related_member(self):
+        self.assertEqual(scope_list_of(action(topic="沙箱隔离"), SCOPE), "related")
+
+    def test_excluded_member(self):
+        self.assertEqual(scope_list_of(action(topic="GPU 性能优化"), SCOPE), "excluded")
+
+    def test_topic_in_no_list(self):
+        self.assertEqual(scope_list_of(action(topic="完全无关的主题"), SCOPE), "none")
+
+    def test_unconfirmed_scope_is_named_unconfirmed(self):
+        self.assertEqual(scope_list_of(action(), unconfirmed()), "unconfirmed")
+
+    def test_excluded_outranks_core(self):
+        # Same precedence as check_scope: a deliberate exclusion cannot be
+        # reopened by the topic also appearing in core.
+        scope = {"core": ["dup"], "related": [], "excluded": ["dup"],
+                 "confirmed": True}
+        self.assertEqual(scope_list_of(action(topic="dup"), scope), "excluded")
+
+    def test_core_outranks_related(self):
+        scope = {"core": ["dup"], "related": ["dup"], "excluded": [],
+                 "confirmed": True}
+        self.assertEqual(scope_list_of(action(topic="dup"), scope), "core")
+
+    def test_surrounding_whitespace_is_ignored(self):
+        self.assertEqual(scope_list_of(action(topic="  Agent 权限控制  "), SCOPE), "core")
+
+    def test_empty_topic_is_in_no_list(self):
+        self.assertEqual(scope_list_of(action(topic=""), SCOPE), "none")
+
+    def test_non_string_topic_is_in_no_list(self):
+        self.assertEqual(scope_list_of(action(topic=None), SCOPE), "none")
+
+
+class TestVerdictCarriesScopeList(unittest.TestCase):
+    """Task 16 ruling 4: every verdict carries the machine-readable list."""
+
+    def verdict(self, raw, scope=SCOPE):
+        return evaluate_action(raw, scope=scope,
+                               budget={"remaining_documents": 100},
+                               seen_topics=[])
+
+    def test_accepted_verdict_names_core(self):
+        result = self.verdict(action())
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["scope_list"], "core")
+
+    def test_excluded_is_a_candidate_topic(self):
+        result = self.verdict(action(topic="GPU 性能优化"))
+        self.assertEqual(result["rejected_as"], "candidate_topic")
+        self.assertEqual(result["scope_list"], "excluded")
+
+    def test_related_without_justification_is_a_candidate_lead(self):
+        result = self.verdict(action(topic="沙箱隔离"))
+        self.assertEqual(result["rejected_as"], "candidate_topic")
+        # candidate_topic + related == a candidate LEAD, not a new topic.
+        self.assertEqual(result["scope_list"], "related")
+
+    def test_out_of_scope_is_a_candidate_topic(self):
+        result = self.verdict(action(topic="完全无关的主题"))
+        self.assertEqual(result["rejected_as"], "candidate_topic")
+        self.assertEqual(result["scope_list"], "none")
+
+    def test_unconfirmed_scope_keeps_its_label_and_scope_list(self):
+        result = self.verdict(action(), scope=unconfirmed())
+        self.assertEqual(result["rejected_as"], "unconfirmed_scope")
+        self.assertEqual(result["scope_list"], "unconfirmed")
+
+    def test_every_verdict_has_a_scope_list(self):
+        cases = [
+            self.verdict(action()),
+            self.verdict(action(topic="GPU 性能优化")),
+            self.verdict(action(topic="沙箱隔离")),
+            self.verdict(action(topic="完全无关的主题")),
+            self.verdict(action(), scope=unconfirmed()),
+            evaluate_action(action(), scope=SCOPE,
+                            budget={"remaining_documents": 100},
+                            seen_topics=["Agent 权限控制"]),
+            evaluate_action(action(), scope=SCOPE, budget={"remaining_documents": 0},
+                            seen_topics=[]),
+            evaluate_action(action(priority=0), scope=SCOPE,
+                            budget={"remaining_documents": 100}, seen_topics=[]),
+        ]
+        for result in cases:
+            with self.subTest(rejected_as=result["rejected_as"]):
+                self.assertIn("scope_list", result)
 
 
 if __name__ == "__main__":
