@@ -23,8 +23,10 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from scripts.collector import normalise_path
-from scripts.lib.http import fetch
+from scripts.lib.http import ROBOTS_AGENT, fetch
+from scripts.lib.policy import POLICIES_FILE, resolve_policy
 from scripts.lib.robots import evaluate_robots, parse_robots
+from scripts.lib.urlnorm import same_origin
 
 # Compliance statuses (spec 6.2). CHECKING is not returned here: it describes a
 # source mid-flight, not a decision.
@@ -161,12 +163,18 @@ def _check_once(fetcher, url, config, delay=None):
 
 
 def check_reachability(source, *, fetcher=None, config=None):
-    """Return REACHABLE when the source's base URL answers, else UNREACHABLE.
+    """Return REACHABLE when the source's base URL answers, else a refusal answer.
 
-    This answers "does this address exist", nothing more. A refusal, a timeout
-    and a server error all mean the address did not answer us, so all three are
-    UNREACHABLE; none of them is a statement about permission (spec 8.4), and
-    an unreachable source never reaches the compliance check.
+    This answers "does this address answer us", nothing more (spec 8.4). The
+    answers stay distinct because the gate maps them to different statuses:
+
+    * ``REACHABLE`` -- the address answered.
+    * ``BLOCKED`` -- the server returned 401, 403 or another 4xx. That is an
+      access refusal, not a missing page: the source is blocked, not merely
+      unreachable. The gate does not consult robots.txt for it, because a
+      refusal to answer already forbids collection.
+    * ``UNREACHABLE`` -- a timeout, a network failure or a 5xx. The address did
+      not answer; that says nothing about permission and never allows in.
     """
     source = source or {}
     fetcher = fetcher or _default_fetcher
@@ -174,8 +182,11 @@ def check_reachability(source, *, fetcher=None, config=None):
     if not base_url:
         return UNREACHABLE
     result = _check_once(fetcher, base_url, config)
-    if (result or {}).get("outcome") == "ok":
+    outcome = (result or {}).get("outcome")
+    if outcome == "ok":
         return REACHABLE
+    if outcome == "blocked":
+        return STATUS_BLOCKED
     return UNREACHABLE
 
 
@@ -225,40 +236,13 @@ def _robot_path(url):
     return normalise_path(raw_path)
 
 
-def _origin_of(url):
-    """Return ``(scheme, host, port)`` for url, or None when unreadable.
-
-    The origin -- not the host -- is the unit robots.txt is defined for, so a
-    scheme or port change is a different rules context just as much as a
-    different host is.
-    """
-    if not isinstance(url, str) or not url:
-        return None
-    try:
-        parts = urlsplit(url)
-        port = parts.port
-    except (TypeError, ValueError):
-        return None
-    scheme = (parts.scheme or "").lower()
-    host = (parts.hostname or "").lower()
-    if not scheme or not host:
-        return None
-    if port is None:
-        port = {"http": 80, "https": 443}.get(scheme)
-    return scheme, host, port
-
-
-def _same_origin(left, right):
-    """Return True when both URLs name the same scheme, host and port."""
-    left_origin = _origin_of(left)
-    return left_origin is not None and left_origin == _origin_of(right)
-
-
-def check_compliance(source, *, fetcher=None, config=None, target_url=None):
+def check_compliance(source, *, fetcher=None, config=None, target_url=None,
+                     policies=None, now=None):
     """Check one source and return its compliance record (spec 6.7).
 
-    Order is reachability, then robots.txt, then the status decision, then the
-    record. The decision priority is fixed and conservative:
+    Order is: a declared ``robots_url`` origin check, reachability, robots.txt,
+    the status decision, the optional policy release, then the record. The
+    decision priority is fixed and conservative:
 
     1. robots ``error`` -> ERROR: the rules could not be read, so the source is
        suspended rather than assumed unrestricted (spec 6.4).
@@ -296,17 +280,37 @@ def check_compliance(source, *, fetcher=None, config=None, target_url=None):
     for ``e.org`` says nothing about ``evil.example``, so an off-origin target
     is marked ``ERROR`` with no recorded path -- the same way a
     misconfiguration is marked -- and no decision marker is written. The
-    collector's own off-host refusal is the second line of defence.
+    collector's own off-host refusal is the second line of defence. An explicit
+    ``robots_url`` must share the base URL's origin for the same reason: a
+    declared rules URL on another origin is never fetched, and the source is
+    marked ``ERROR``.
 
-    Two configuration failures write ``checked_at`` of ``None``: an unreadable
-    target path and an off-origin target. No decision was made for those
-    records, so the next round must not reuse whatever status they carry.
+    robots.txt is evaluated **as this client**: the rules are queried with
+    ``ROBOTS_AGENT``, the product token the transport sends, not with the
+    wildcard group. A site-wide ``User-agent: ResearchScout`` refusal therefore
+    blocks the source even when no wildcard group exists, and a wildcard-only
+    site still permits it.
+
+    ``policies`` is the user authorisation registry (spec 6.5, V13). It is
+    consulted **only** when the computed status is ``REVIEW_REQUIRED``: a live,
+    in-scope, unexpired ``ALLOWED`` policy releases the source to ``ALLOWED``
+    with an evidence entry naming the registry. ``BLOCKED``, ``ERROR`` and
+    ``UNREACHABLE`` are never relaxed by a policy. ``now`` overrides the clock
+    for tests; the same instant is used for ``checked_at`` and for expiry.
+
+    Three configuration failures write ``checked_at`` of ``None``: an
+    unreadable target path, an off-origin target, and an off-origin declared
+    ``robots_url``. No decision was made for those records, so the next round
+    must not reuse whatever status they carry.
     """
     source = source or {}
     fetcher = fetcher or _default_fetcher
     base_url = source.get("base_url") or ""
     domain = _domain_of(source, base_url)
-    checked_at = datetime.now(timezone.utc).isoformat()
+    clock = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    if clock.tzinfo is None:
+        clock = clock.replace(tzinfo=timezone.utc)
+    checked_at = clock.isoformat()
     access_method = source.get("access_method") or "web"
     allowed_paths = []
     evidence = []
@@ -317,6 +321,8 @@ def check_compliance(source, *, fetcher=None, config=None, target_url=None):
     # recorded permission describe the path that will actually be enforced.
     target = target_url if target_url else base_url
     evaluated_path = _robot_path(target)
+    robots_url = _robots_url(source)
+    declared_robots = (source or {}).get("robots_url")
 
     record = {
         "source_id": source.get("source_id"),
@@ -347,20 +353,62 @@ def check_compliance(source, *, fetcher=None, config=None, target_url=None):
         record["notes"] = "; ".join(notes)
         return record
 
-    # Step 1: reachability. An address that does not answer is not checked
-    # further and is not collected from.
-    if check_reachability(source, fetcher=fetcher, config=config) != REACHABLE:
-        notes.append(
-            "base URL did not answer; the source is marked UNREACHABLE and "
-            "does not enter the compliance check"
+    # An explicit robots URL on another origin would make the gate consult
+    # rules that do not describe this source and then apply them to it. That is
+    # a configuration failure, not a permission decision: it is refused before
+    # any request is made, with no decision marker.
+    if declared_robots and not same_origin(base_url, declared_robots):
+        record["compliance_status"] = STATUS_ERROR
+        record["checked_at"] = None
+        evidence.append(
+            _evidence(
+                "robots_url",
+                declared_robots,
+                "declared robots URL is on a different origin from base_url",
+                "robots.txt for another origin does not describe this source; "
+                "it was not fetched and no path is recorded",
+            )
         )
+        notes.append(
+            f"declared robots_url {declared_robots!r} is on a different origin "
+            f"from base URL {base_url!r}; it was not consulted"
+        )
+        evidence.append(_address_evidence(base_url))
+        record["notes"] = "; ".join(notes)
+        return record
+
+    # Step 1: reachability. An address that does not answer is not checked
+    # further and is not collected from. A refusal (401/403/4xx) is BLOCKED, a
+    # transport failure is UNREACHABLE; neither consults robots.txt and neither
+    # is ever a permission.
+    reachability = check_reachability(source, fetcher=fetcher, config=config)
+    if reachability != REACHABLE:
+        if reachability == STATUS_BLOCKED:
+            record["compliance_status"] = STATUS_BLOCKED
+            notes.append(
+                "base URL refused the request (401/403 or another 4xx); the "
+                "source is BLOCKED and robots.txt was not consulted"
+            )
+            evidence.append(
+                _evidence(
+                    "reachability",
+                    base_url,
+                    "the source refused the reachability request",
+                    "an access refusal is a rule against collection; robots.txt "
+                    "was not consulted",
+                )
+            )
+        else:
+            notes.append(
+                "base URL did not answer; the source is marked UNREACHABLE and "
+                "does not enter the compliance check"
+            )
         evidence.append(_address_evidence(base_url))
         record["notes"] = "; ".join(notes)
         return record
 
     # Step 2: robots.txt. The rules are not known yet, so this request uses the
     # configured delay.
-    robots_url = _robots_url(source)
     robots_result = _check_once(fetcher, robots_url, config)
     robots_status, robots_reason = evaluate_robots(robots_result)
     record["robots_status"] = robots_status
@@ -373,8 +421,10 @@ def check_compliance(source, *, fetcher=None, config=None, target_url=None):
     # unusable one leaves the configured default in place. The resolved value
     # is both recorded and applied to the requests the gate makes, so a source
     # that asks to be crawled slowly is not merely labelled as such.
+    # The rules are queried as this client, not as the wildcard: a group for
+    # "ResearchScout" governs this tool even when no "*" group exists.
     rules = parse_robots((robots_result or {}).get("text") or "")
-    crawl_delay = rules.crawl_delay()
+    crawl_delay = rules.crawl_delay(ROBOTS_AGENT)
     if crawl_delay is not None and crawl_delay > record["request_rate_limit"]:
         record["request_rate_limit"] = crawl_delay
         notes.append(f"robots.txt Crawl-delay sets the request interval to {crawl_delay}s")
@@ -385,7 +435,7 @@ def check_compliance(source, *, fetcher=None, config=None, target_url=None):
     # that answer does not cover another origin. No path is recorded for it,
     # and no decision marker is written, because no decision was made about
     # this target. The collector's off-host refusal remains the second line.
-    if target_url and not _same_origin(base_url, target_url):
+    if target_url and not same_origin(base_url, target_url):
         record["compliance_status"] = STATUS_ERROR
         record["checked_at"] = None
         evidence.append(
@@ -408,7 +458,7 @@ def check_compliance(source, *, fetcher=None, config=None, target_url=None):
         record["compliance_status"] = STATUS_BLOCKED
         notes.append("robots.txt refuses this request; automatic collection stops")
     elif robots_status == "allowed":
-        if not rules.is_allowed(evaluated_path):
+        if not rules.is_allowed(evaluated_path, ROBOTS_AGENT):
             record["compliance_status"] = STATUS_BLOCKED
             notes.append(
                 f"robots.txt disallows {evaluated_path} for this source"
@@ -439,6 +489,38 @@ def check_compliance(source, *, fetcher=None, config=None, target_url=None):
                 )
             )
         record["compliance_status"] = terms_decision or STATUS_ALLOWED
+
+    # Step 5: a user authorisation releases REVIEW_REQUIRED only. The policy is
+    # consulted after the gate's own decision, so it can never relax BLOCKED,
+    # ERROR or UNREACHABLE, and resolve_policy itself returns only a live,
+    # in-scope ALLOWED record.
+    if record["compliance_status"] == STATUS_REVIEW_REQUIRED and policies:
+        policy = resolve_policy(
+            policies,
+            source_id=source.get("source_id") or "",
+            path=evaluated_path,
+            access_method=access_method,
+            now=clock,
+        )
+        if policy is not None:
+            record["compliance_status"] = STATUS_ALLOWED
+            scope = policy.get("scope") if isinstance(policy.get("scope"), dict) else {}
+            evidence.append(
+                _evidence(
+                    "source_policy",
+                    str(POLICIES_FILE),
+                    "user authorisation resolved_status=ALLOWED for "
+                    f"access_method {access_method!r} and path {evaluated_path!r}; "
+                    f"expires_at {scope.get('expires_at')!r}",
+                    "a scoped, unexpired user authorisation releases this "
+                    "REVIEW_REQUIRED source; it is a product action, not a "
+                    "licence",
+                )
+            )
+            notes.append(
+                "released by a user authorisation in "
+                f"{POLICIES_FILE}"
+            )
 
     # The resolved pacing is applied, not just recorded. The reachability
     # request above ran before the rules were known, so when robots.txt asked
