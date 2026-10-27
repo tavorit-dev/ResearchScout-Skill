@@ -361,7 +361,7 @@ class TestRoundCollection(TempCase):
             root, round_no=1, actions=[], config={"iteration_policy": {}},
             fetcher=text_fetcher(PAGE),
             sources=[source(source_id="src_page", access_method="web",
-                            feed_url=None, base_url="https://e.org")],
+                            feed_url="", base_url="https://e.org")],
         )
 
         self.assertEqual(len(handoff["new_documents"]), 1)
@@ -376,7 +376,7 @@ class TestRoundCollection(TempCase):
             root, round_no=1, actions=[], config={"iteration_policy": {}},
             fetcher=text_fetcher("just some plain text, no markup"),
             sources=[source(source_id="src_page", access_method="web",
-                            feed_url=None, base_url="https://e.org")],
+                            feed_url="", base_url="https://e.org")],
         )
         self.assertEqual(handoff["new_documents"], [])
 
@@ -388,7 +388,7 @@ class TestRoundCollection(TempCase):
             root, round_no=1, actions=[], config={"iteration_policy": {}},
             fetcher=text_fetcher(PAGE, final_url="https://evil.example/page"),
             sources=[source(source_id="src_page", access_method="web",
-                            feed_url=None, base_url="https://e.org")],
+                            feed_url="", base_url="https://e.org")],
         )
         self.assertEqual(handoff["new_documents"], [])
 
@@ -487,12 +487,12 @@ class TestComplianceGateInRound(TempCase):
         root = layout_root(self.tmp)
         review = source(source_id="src_review",
                         base_url="https://review.example",
-                        access_method="web", feed_url=None,
+                        access_method="web", feed_url="",
                         terms_url="https://review.example/terms")
         review.pop("checked_at")
         error = source(source_id="src_error",
                        base_url="https://error.example",
-                       access_method="web", feed_url=None)
+                       access_method="web", feed_url="")
         error.pop("checked_at")
 
         fetcher = routed_fetcher({
@@ -986,7 +986,7 @@ class TestAllowedPathsInTheRound(TempCase):
             root, round_no=1, actions=[], config={"iteration_policy": {}},
             fetcher=text_fetcher(PAGE, final_url="https://e.org/secret/page"),
             sources=[source(source_id="src_page", access_method="web",
-                            feed_url=None, allowed_paths=["/public"])],
+                            feed_url="", allowed_paths=["/public"])],
         )
         self.assertEqual(handoff["new_documents"], [])
 
@@ -996,7 +996,7 @@ class TestAllowedPathsInTheRound(TempCase):
             root, round_no=1, actions=[], config={"iteration_policy": {}},
             fetcher=text_fetcher(PAGE, final_url="https://e.org/public/page"),
             sources=[source(source_id="src_page", access_method="web",
-                            feed_url=None, allowed_paths=["/public"])],
+                            feed_url="", allowed_paths=["/public"])],
         )
         self.assertEqual(len(handoff["new_documents"]), 1)
 
@@ -1058,6 +1058,65 @@ class TestNonMappingAction(TempCase):
         pending = json.loads(
             (root / "state" / "pending_actions.json").read_text("utf-8"))
         self.assertEqual(len(pending["rejected"]), 1)
+
+
+# -- fix round 3: persisted sources must validate ----------------------------
+
+
+class TestPersistedSourcesCarryTheirTransportAddress(TempCase):
+    """Every record in ``selected_sources.jsonl`` must satisfy the source schema.
+
+    The transport address (``feed_url`` / ``api_url``) is where the collector
+    reads, so it has to survive the round. Round 2 then reads the file back and
+    needs it; dropping it would make an rss source uncollectable. The schema
+    therefore has to describe the field instead of the round exempting it from
+    validation, which is what let a schema-invalid record into the archive.
+    """
+
+    def test_rss_source_with_feed_url_persists_and_validates(self):
+        root = layout_root(self.tmp)
+        run_round(root, round_no=1, actions=[], config={"iteration_policy": {}},
+                  fetcher=text_fetcher(FEED_ONE), sources=[source()])
+
+        stored = selected_records(root)
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["feed_url"], "https://e.org/feed")
+        for record in stored:
+            validate_record("source", record)
+
+    def test_api_source_with_api_url_persists_and_validates(self):
+        root = layout_root(self.tmp)
+        run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=text_fetcher(FEED_ONE),
+            sources=[source(source_id="src_api", access_method="api",
+                            feed_url="", api_url="https://e.org/api/v1")],
+        )
+
+        stored = selected_records(root)
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["api_url"], "https://e.org/api/v1")
+        for record in stored:
+            validate_record("source", record)
+
+    def test_round_two_reads_the_feed_url_from_the_file_and_fetches_it(self):
+        # Round 2 is given ``sources=None``, so its records come from the file
+        # the first round wrote. Cross-round dedup keeps the document count at
+        # zero, but the collector must still be pointed at the persisted feed
+        # address -- that is what the schema change is meant to keep working.
+        root = layout_root(self.tmp)
+        config = {"iteration_policy": {}}
+        first_fetcher = text_fetcher(FEED_ONE)
+        run_round(root, round_no=1, actions=[], config=config,
+                  fetcher=first_fetcher, sources=[source()])
+        self.assertEqual(first_fetcher.calls, ["https://e.org/feed"])
+
+        second_fetcher = text_fetcher(FEED_ONE)
+        handoff = run_round(root, round_no=2, actions=[], config=config,
+                            fetcher=second_fetcher, sources=None)
+
+        self.assertEqual(second_fetcher.calls, ["https://e.org/feed"])
+        self.assertEqual(handoff["new_documents"], [])
 
 
 # -- apply_results: the agent boundary --------------------------------------

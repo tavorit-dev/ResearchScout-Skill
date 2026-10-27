@@ -82,6 +82,14 @@
       "type": "string",
       "description": "How the source is read, for example web, rss or api."
     },
+    "feed_url": {
+      "type": "string",
+      "description": "Transport address an rss source is read at. It must name the same host as base_url: the collector refuses a different host, and the compliance gate only ever checked base_url. Empty or absent means the base URL is read instead."
+    },
+    "api_url": {
+      "type": "string",
+      "description": "Transport address an api source is read at. It must name the same host as base_url: the collector refuses a different host, and the compliance gate only ever checked base_url. Empty or absent means the base URL is read instead."
+    },
     "last_checked_at": {
       "type": ["string", "null"],
       "description": "Timestamp of the last compliance check, ISO 8601."
