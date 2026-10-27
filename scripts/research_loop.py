@@ -147,13 +147,6 @@ SCORE_FIELDS = tuple(FINDING_SCORE_FIELDS.values())
 # that is not an action record.
 REJECT_INVALID_ACTION = "invalid_action"
 
-# Fields the collector needs that ``source.schema.json`` does not model. They
-# are transport configuration -- where to read the feed or API -- rather than
-# source identity, so schema validation is applied to the record without them.
-# Keeping them on the record is what lets a decision survive across rounds for
-# an RSS or API source.
-TRANSPORT_FIELDS = ("feed_url", "api_url")
-
 # The retention mode this module may claim honestly. The extraction path keeps
 # the metadata and the fingerprint, never the body, so ``reference`` is the
 # only accurate value (spec 9.6).
@@ -211,9 +204,10 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
        JSON object, or that fails ``source.schema.json``, is reported in
        ``actions_rejected`` (or shown in ``candidates_for_review`` when it is
        unverified) and is never written to ``selected_sources.jsonl`` and never
-       collected. The two transport fields the collector needs but the v1
-       schema does not model (``feed_url``, ``api_url``) are exempt from that
-       validation; see ``_source_schema_error``. Sources whose
+       collected. The validation covers the whole record, including the
+       ``feed_url`` / ``api_url`` transport addresses the collector reads;
+       ``source.schema.json`` describes those fields, so a record that is
+       persisted is a record that validates. Sources whose
        ``discovery_verified`` is not exactly ``True`` go to
        ``candidates_for_review`` and are **never** collected (spec 8.3, V5);
        that split is program-enforced, not a note in the handoff.
@@ -876,21 +870,17 @@ def _admit_sources(sources):
 def _source_schema_error(source):
     """Return the schema error for a source record, or ``None`` when valid.
 
-    ``source.schema.json`` forbids unknown properties, but it predates the
-    collector's two transport fields: an RSS source names where to read in
-    ``feed_url`` and an API source in ``api_url``, and neither is part of the
-    schema. They are where to read, not what the source is, so the record is
-    validated without them and they are kept for collection. Every other
-    field -- including the required ``source_id``, ``base_url``,
-    ``compliance_status`` and ``selection_status`` -- is checked exactly as
-    the schema states.
+    The record is validated exactly as it will be persisted. That includes the
+    transport addresses ``feed_url`` and ``api_url``: ``source.schema.json``
+    describes them as optional strings because round 2 reads the file back and
+    the collector needs them to find the feed or API. Exempting them from
+    validation here is what once let a schema-invalid record into the archive,
+    so the whole record crosses this boundary.
     """
     if not isinstance(source, dict):
         return "source record is not a JSON object"
-    candidate = {key: value for key, value in source.items()
-                 if key not in TRANSPORT_FIELDS}
     try:
-        validate_record("source", candidate)
+        validate_record("source", source)
     except ValidationError as exc:
         return _validation_error_message(exc)
     return None

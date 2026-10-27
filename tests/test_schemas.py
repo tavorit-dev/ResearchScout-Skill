@@ -68,6 +68,28 @@ class TestSchemas(unittest.TestCase):
             "notes": "", "selection_status": "selected",
         })
 
+    def test_source_accepts_optional_transport_addresses(self):
+        # feed_url / api_url are where the collector reads. They are optional,
+        # but a persisted record carries them, so the schema must describe them.
+        validate_record("source", {
+            "source_id": "src_1", "base_url": "https://e.org",
+            "compliance_status": "DISCOVERED", "selection_status": "pending",
+            "access_method": "rss", "feed_url": "https://e.org/feed",
+        })
+        validate_record("source", {
+            "source_id": "src_2", "base_url": "https://e.org",
+            "compliance_status": "DISCOVERED", "selection_status": "pending",
+            "access_method": "api", "api_url": "https://e.org/api",
+        })
+
+    def test_source_rejects_a_non_string_transport_address(self):
+        with self.assertRaises(ValidationError):
+            validate_record("source", {
+                "source_id": "src_1", "base_url": "https://e.org",
+                "compliance_status": "DISCOVERED", "selection_status": "pending",
+                "feed_url": None,
+            })
+
     def test_source_rejects_unknown_field(self):
         with self.assertRaises(ValidationError):
             validate_record("source", {
