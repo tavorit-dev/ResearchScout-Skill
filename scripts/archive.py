@@ -31,6 +31,14 @@ stakes are the reason for the three principles this module enforces:
    first state is written by ``planner.init_research``; this module never
    invents one.
 
+4. **A writer never invents a project.** Every writer requires the project
+   directory it owns (``state/``, ``documents/``, ``findings/``,
+   ``iterations/``, ``summaries/``) to already exist. Creating a project is
+   ``planner.init_research``'s job alone. A writer that manufactured one at a
+   mistyped path would leave the real project untouched and make principle 3
+   meaningless: "incomplete" and "never initialised" would look identical.
+   The atomic writer therefore never creates directories either.
+
 The record formats are the ones ``schemas/`` defines; document records keep
 metadata and a reference to the body, never the body itself (spec 9.6, spec
 9.8). The CSV export reuses ``scripts.lib.jsonl.write_csv`` so the
@@ -52,9 +60,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from jsonschema import ValidationError
 
 from scripts.lib.jsonl import read_records, upsert_by_id, write_csv
-from scripts.lib.paths import ensure_research_layout
 from scripts.lib.validate import validate_record
 
 # Project-relative paths, all below the research root (spec 9.2).
@@ -80,15 +88,44 @@ CSV_FIELDS = (
 ROUND_DIGITS = 3
 
 
+def _require_project(root, subdir):
+    """Return ``root`` if its ``subdir`` exists; raise ``FileNotFoundError``.
+
+    ``subdir`` is the directory this writer owns, so requiring it proves the
+    root is an initialised project from this module's point of view. A caller
+    that mistyped the path gets an error naming the root instead of a second,
+    empty project; the real project is left alone.
+    """
+    root = Path(root)
+    required = root / subdir
+    if not required.is_dir():
+        raise FileNotFoundError(
+            f"research project not found at {root}: {subdir}/ is missing; "
+            f"initialize the project with planner.init_research first"
+        )
+    return root
+
+
 def save_state(root, state):
     """Atomically write the current research state to ``state/current.json``.
 
-    ``state`` is a JSON object the caller owns; this module does not define
-    its fields. The write goes through a same-directory temporary file and
-    ``os.replace``, so a run interrupted mid-write leaves the previous state
-    readable rather than a truncated file (spec 9.3).
+    ``state`` is a mapping the caller owns; this module does not define its
+    fields. It **must be a mapping**, because ``load_state`` reads the file
+    back as a JSON object: writing a list or scalar would replace the
+    resumable state with something the reader rejects, so that shape is
+    refused with ``TypeError`` before anything reaches disk.
+
+    ``state/`` must already exist (see ``_require_project``). The write goes
+    through a same-directory temporary file and ``os.replace``, so a run
+    interrupted mid-write leaves the previous state readable rather than a
+    truncated file (spec 9.3).
     """
-    root = ensure_research_layout(root)
+    if not isinstance(state, dict):
+        raise TypeError(
+            f"research state must be a mapping (a JSON object), got "
+            f"{type(state).__name__}"
+        )
+    root = _require_project(root, STATE_FILE.parent)
     _write_json(root / STATE_FILE, state)
 
 
@@ -103,9 +140,9 @@ def load_state(root):
         initial state, so a missing file means the project is incomplete, and
         returning ``{}`` would restart it at round zero with its budget reset.
     ValueError
-        The file cannot be read, is not valid JSON (truncated, ``"[]"``,
-        ``"null"``), or is valid JSON but not an object, with its path in the
-        message.
+        The file cannot be read, is not valid UTF-8, is not valid JSON
+        (truncated, ``"[]"``, ``"null"``), or is valid JSON but not an
+        object, with its path in the message.
     """
     path = Path(root) / STATE_FILE
     try:
@@ -115,6 +152,10 @@ def load_state(root):
             f"research state file not found: {path}; the project is "
             f"incomplete, not unstarted -- initialize it with "
             f"planner.init_research or restore the file"
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"research state {path} is not valid UTF-8: {exc}"
         ) from exc
     except OSError as exc:
         raise ValueError(f"cannot read research state {path}: {exc}") from exc
@@ -136,24 +177,39 @@ def save_documents(root, docs):
 
     Every record is validated against ``document.schema.json`` before the
     first write, so an invalid record leaves the existing file untouched
-    instead of leaving a partial upsert behind. Upsert (rather than replace)
-    is the right shape because the same document is written several times as
-    it moves through ``FETCHED`` to ``PERSISTED``.
+    instead of leaving a partial upsert behind. A batch failure names the
+    record's index and ``document_id``. Upsert (rather than replace) is the
+    right shape because the same document is written several times as it
+    moves through ``FETCHED`` to ``PERSISTED``.
 
     An empty list returns 0 and creates no file: a project with no documents
-    yet should not carry an empty archive file.
+    yet should not carry an empty archive file. ``save_findings([])`` differs
+    deliberately -- it writes an empty ``findings.jsonl`` -- because a finding
+    set is authoritative and "no findings" is a real state, while there is no
+    empty document row to write.
+
+    ``documents/`` must already exist (see ``_require_project``).
 
     ``upsert_by_id`` rewrites the whole file rather than replacing it through
     a temporary file. That non-atomicity is a known deferred minor from the
     JSONL library (Task 4) and is deliberately not reimplemented here.
     """
     records = list(docs)
+    root = _require_project(root, DOCUMENTS_FILE.parent)
     if not records:
         return 0
-    for record in records:
-        validate_record("document", record)
+    for index, record in enumerate(records):
+        try:
+            validate_record("document", record)
+        except ValidationError as exc:
+            identifier = None
+            if isinstance(record, dict):
+                identifier = record.get("document_id")
+            raise ValidationError(
+                f"document record {index} (document_id={identifier!r}) is "
+                f"invalid: {exc.message}"
+            ) from exc
 
-    root = ensure_research_layout(root)
     path = root / DOCUMENTS_FILE
     for record in records:
         upsert_by_id(path, record, "document_id")
@@ -170,16 +226,34 @@ def save_findings(root, findings):
     findings rather than accumulate them.
 
     All records are validated against ``finding.schema.json`` before anything
-    is written. A scored finding -- one still carrying the ``*_score`` fields
-    ``compute_weight`` reads -- fails this check, which is the intended
+    is written, and a batch failure names the record's index and
+    ``finding_id``. A scored finding -- one still carrying the ``*_score``
+    fields ``compute_weight`` reads -- fails this check, which is the intended
     contract: those fields are in-memory inputs, not persistable record
     fields. The file is replaced atomically.
+
+    An empty list still writes ``findings.jsonl``, as an empty file. That is
+    the deliberate opposite of ``save_documents([])`` (which writes nothing
+    and returns 0): the file holds the complete authoritative finding set, so
+    "no findings" is a state worth recording, whereas there is no empty
+    document row to write.
+
+    ``findings/`` must already exist (see ``_require_project``).
     """
     records = list(findings)
-    for record in records:
-        validate_record("finding", record)
+    root = _require_project(root, FINDINGS_FILE.parent)
+    for index, record in enumerate(records):
+        try:
+            validate_record("finding", record)
+        except ValidationError as exc:
+            identifier = None
+            if isinstance(record, dict):
+                identifier = record.get("finding_id")
+            raise ValidationError(
+                f"finding record {index} (finding_id={identifier!r}) is "
+                f"invalid: {exc.message}"
+            ) from exc
 
-    root = ensure_research_layout(root)
     text = "".join(
         json.dumps(record, ensure_ascii=False) + "\n" for record in records
     )
@@ -191,19 +265,30 @@ def save_iteration(root, round_no, record):
 
     ``round_no`` is zero-padded so the files sort chronologically as text.
     The record is serialised as JSON; no schema is defined for an iteration
-    record, whose shape is the caller's (Task 16).
+    record, whose shape is the caller's (Task 16), but it **must be a
+    mapping** so the file is always a JSON object rather than a bare scalar
+    or list.
+
+    ``iterations/`` must already exist (see ``_require_project``).
 
     Raises
     ------
     ValueError
         ``round_no`` is not a non-negative integer. A bool is not a round
         number even though Python calls it an int.
+    TypeError
+        ``record`` is not a mapping.
     """
     if isinstance(round_no, bool) or not isinstance(round_no, int) or round_no < 0:
         raise ValueError(
             f"round number must be a non-negative integer, got {round_no!r}"
         )
-    root = ensure_research_layout(root)
+    if not isinstance(record, dict):
+        raise TypeError(
+            f"iteration record must be a mapping (a JSON object), got "
+            f"{type(record).__name__}"
+        )
+    root = _require_project(root, ITERATIONS_DIR)
     path = root / ITERATIONS_DIR / f"round-{round_no:0{ROUND_DIGITS}d}.json"
     _write_json(path, record)
 
@@ -215,8 +300,11 @@ def save_summary(root, text):
     snapshot keeps every earlier version so a resumed run can show how the
     findings evolved. Both are written atomically, and the snapshot name is
     unique so two consecutive calls never overwrite the first.
+
+    ``summaries/`` must already exist (see ``_require_project``); the nested
+    ``summaries/snapshots/`` belongs to this writer and may be created.
     """
-    root = ensure_research_layout(root)
+    root = _require_project(root, SUMMARY_FILE.parent)
     _atomic_write_text(root / SUMMARY_FILE, text)
     snapshot = _unique_snapshot_path(root / SNAPSHOTS_DIR)
     _atomic_write_text(snapshot, text)
@@ -237,6 +325,10 @@ def rebuild_manifest(root):
         that is present and broken is not the same as an absent one, and
         reporting ``null`` would hide the corruption the manifest exists to
         surface.
+    FileNotFoundError
+        ``root`` is not an initialised project, so ``index/`` does not exist.
+        The manifest is a writer too: a mistyped root must not gain an
+        ``index/manifest.json`` and look like an empty project.
 
     The returned dict is the one written to the file.
     """
@@ -260,9 +352,11 @@ def export_csv(root):
     in that order. The file is UTF-8 with a BOM so Excel opens it correctly
     (acceptance V8), which ``write_csv`` already guarantees. A missing or empty
     archive still produces a valid CSV with its header row, because an empty
-    research project is still exportable.
+    research project is still exportable. ``documents/`` itself must already
+    exist (see ``_require_project``), so a mistyped root is an error rather
+    than a new directory tree.
     """
-    root = Path(root)
+    root = _require_project(root, DOCUMENTS_FILE.parent)
     path = root / DOCUMENTS_CSV
     write_csv(path, read_records(root / DOCUMENTS_FILE), list(CSV_FIELDS))
     return path
@@ -276,17 +370,46 @@ def _atomic_write_text(path, text):
     not. The content is flushed and fsynced before the rename so a rename
     never publishes bytes that are still buffered. On any failure the
     temporary file is removed and the original path is left as it was.
+
+    This function **never creates a directory**: the parent must already
+    exist, otherwise it raises ``FileNotFoundError``. A writer that could
+    create its own parent would recreate the skeleton a mistyped root needs,
+    which is exactly how a typo becomes a second, empty project.
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    parent = path.parent
+    if not parent.is_dir():
+        raise FileNotFoundError(
+            f"cannot write {path}: parent directory {parent} does not exist"
+        )
+
+    # Sweep temporary files a crashed writer left behind. This is a
+    # single-process tool, so there is no concurrent writer of this path to
+    # race with; a stale file can only be debris, never live work.
+    for stale in parent.glob(f".{path.name}.*"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
     descriptor, tmp_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+        dir=parent, prefix=f".{path.name}.", suffix=".tmp"
     )
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
+        try:
+            stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            # os.fdopen failed before the ``with`` block took ownership of the
+            # descriptor, so close it here or it leaks.
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        with stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(tmp_name, path)
     except BaseException:
         # Both paths are best effort: the original exception is what the
@@ -349,11 +472,15 @@ def _read_research_id(path):
 
 
 def _count_rounds(directory):
-    """Count ``round-*.json`` files; a missing directory has none."""
+    """Count ``round-*.json`` files; a missing directory has none.
+
+    Only files count. A directory that happens to be named like a round is
+    not a round record and must not inflate the manifest.
+    """
     directory = Path(directory)
     if not directory.is_dir():
         return 0
-    return sum(1 for _ in directory.glob("round-*.json"))
+    return sum(1 for path in directory.glob("round-*.json") if path.is_file())
 
 
 def _utc_now():
