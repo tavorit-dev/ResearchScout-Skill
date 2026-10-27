@@ -35,6 +35,8 @@ returns less text rather than text from a region it cannot identify.
 import re
 from html.parser import HTMLParser
 
+from scripts.lib.sanitize import contains_injection_markers, wrap_untrusted
+
 # Date confidence values (spec 10.2). A date the page stated in full is
 # "explicit"; anything else is "unknown" and the value stays None.
 DATE_CONFIDENCE_EXPLICIT = "explicit"
@@ -194,9 +196,9 @@ def _is_real_calendar_date(year, month, day):
 def extract_content(html, url):
     """Extract title, body text, author and publication date from a page.
 
-    ``url`` is the address the body was fetched from. It is carried for the
-    caller's bookkeeping and is never dereferenced here: extraction performs
-    no network access of any kind.
+    ``url`` is the address the body was fetched from. It becomes the
+    ``source_url`` of the untrusted wrapper and is never dereferenced here:
+    extraction performs no network access of any kind.
 
     Returns a dict with:
 
@@ -206,12 +208,19 @@ def extract_content(html, url):
     * ``published_at`` -- an ISO date the page stated in full, else ``None``.
     * ``date_confidence`` -- ``"explicit"`` when ``published_at`` was stated
       in full, ``"unknown"`` otherwise (spec 10.2).
+    * ``untrusted`` -- the body wrapped by ``wrap_untrusted``:
+      ``{"trust": "untrusted", "source_url": url, "content": text}``. The
+      content is the body unchanged; the mark says how to read it, it does
+      not rewrite it (spec 10.5).
+    * ``injection_markers`` -- advisory marker phrases found in the title and
+      body, unique and in first-occurrence order. A marker in the title is
+      reported even though the wrapped content stays the body only. A hit is
+      a warning, never a reason to alter or discard the extract.
 
     The page is untrusted input (spec 10.5) and is treated as data only. The
     return value is built in one place so later stages can add fields without
     restructuring it.
     """
-    del url  # Carried for the caller; extraction never fetches anything.
     if not isinstance(html, str):
         html = ""
     parser = _PageParser()
@@ -234,6 +243,10 @@ def extract_content(html, url):
         "author": parser.author(),
         "published_at": published_at,
         "date_confidence": date_confidence,
+        "untrusted": wrap_untrusted(text, source_url=url),
+        # The title is checked too: a marker there is not in the wrapped body,
+        # but it is still text the host will read.
+        "injection_markers": contains_injection_markers(title + "\n" + text),
     }
 
 

@@ -102,6 +102,7 @@ from scripts.lib.config import DEFAULTS, load_config
 from scripts.lib.hashing import content_hash
 from scripts.lib.ids import new_id
 from scripts.lib.jsonl import read_records, upsert_by_id
+from scripts.lib.sanitize import contains_injection_markers
 from scripts.lib.urlnorm import normalize_url
 from scripts.lib.validate import validate_record
 from scripts.planner import load_research
@@ -271,6 +272,12 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
        is re-evaluated at the end: being exactly *at* a limit (requests,
        documents this round, documents per research, runtime) is exhaustion,
        not permission for one more.
+
+    ``document_texts`` and ``document_warnings`` are transient handoff fields
+    built from this round's new documents only. The text is the material the
+    host may analyse; the warnings are the advisory marker phrases found in
+    that same text. Neither is a document field and neither is persisted, and
+    a warning never blocks, rewrites or re-fetches a document.
 
     The round is single-pass: it returns after step 6 and never schedules the
     next one. ``decision`` is the host's to make in ``apply_results``.
@@ -649,10 +656,20 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
         document_id = document.get("document_id")
         if isinstance(document_id, str) and document_id in text_by_id:
             document_texts[document_id] = text_by_id[document_id]
+    # Advisory only: the same marker detector runs over the same transient
+    # text the host will read, so a web body and a feed summary cannot take
+    # different paths. This is a warning, never a block, a rewrite or a
+    # reason to re-fetch; it is not persisted and not a document field.
+    document_warnings = {}
+    for document_id, text in document_texts.items():
+        markers = contains_injection_markers(text)
+        if markers:
+            document_warnings[document_id] = markers
     return {
         "round": round_no,
         "new_documents": new_documents,
         "document_texts": document_texts,
+        "document_warnings": document_warnings,
         "candidates_for_review": review_sources,
         "state_summary": summarize_state(current_findings, [], []),
         "remaining_budget": {
