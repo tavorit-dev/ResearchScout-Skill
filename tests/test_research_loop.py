@@ -1797,6 +1797,66 @@ class TestCli(TempCase):
         self.assertEqual(handoff["round"], 1)
         self.assertIn("new_documents", handoff)
 
+    def test_round_with_only_sources_runs(self):
+        root = layout_root(self.tmp)
+        sources_path = self.tmp / "sources.json"
+        sources_path.write_text(json.dumps([{
+            # An unverified source is a review candidate, so the round
+            # reports it without performing any fetch.
+            "source_id": "src_review",
+            "source_name": "e.org",
+            "base_url": "https://e.org",
+            "access_method": "web",
+            "compliance_status": "DISCOVERED",
+            "discovery_verified": False,
+            "selection_status": "pending",
+        }]), encoding="utf-8")
+
+        code, out, _ = self.run_main([
+            "--root", str(root), "--round", "1",
+            "--sources", str(sources_path),
+        ])
+
+        self.assertEqual(code, 0)
+        handoff = json.loads(out)
+        self.assertEqual(handoff["round"], 1)
+        self.assertEqual(len(handoff["candidates_for_review"]), 1)
+        self.assertEqual(handoff["new_documents"], [])
+
+    def test_round_passes_actions_and_sources(self):
+        root = project(self.tmp, scope=CONFIRMED_SCOPE)
+        actions_path = self.tmp / "actions.json"
+        actions_path.write_text(json.dumps([action()]), encoding="utf-8")
+        sources_path = self.tmp / "sources.json"
+        sources_path.write_text(json.dumps([{
+            "source_id": "src_review",
+            "base_url": "https://e.org",
+            "compliance_status": "DISCOVERED",
+            "discovery_verified": False,
+            "selection_status": "pending",
+        }]), encoding="utf-8")
+
+        code, out, _ = self.run_main([
+            "--root", str(root), "--round", "1",
+            "--actions", str(actions_path), "--sources", str(sources_path),
+        ])
+
+        self.assertEqual(code, 0)
+        handoff = json.loads(out)
+        self.assertEqual(len(handoff["candidates_for_review"]), 1)
+        pending = json.loads(
+            (root / "state" / "pending_actions.json").read_text("utf-8")
+        )
+        self.assertEqual([item["action_id"] for item in pending["accepted"]],
+                         ["act_1"])
+
+    def test_round_without_actions_or_sources_fails(self):
+        root = layout_root(self.tmp)
+        with self.assertRaises(SystemExit) as caught:
+            with redirect_stderr(io.StringIO()):
+                main(["--root", str(root), "--round", "1"])
+        self.assertNotEqual(caught.exception.code, 0)
+
     def test_apply_prints_a_json_result(self):
         root = layout_root(self.tmp)
         results_path = self.tmp / "results.json"

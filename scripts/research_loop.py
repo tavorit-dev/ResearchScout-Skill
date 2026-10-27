@@ -1622,11 +1622,15 @@ def _build_parser():
     )
     parser.add_argument(
         "--round", dest="round_no", type=int, metavar="<N>",
-        help="要执行的轮次编号",
+        help="要执行的轮次编号（需要 --actions 和/或 --sources）",
     )
     parser.add_argument(
         "--actions", metavar="<actions.json>",
-        help="候选行动的 JSON 数组文件",
+        help="候选行动的 JSON 数组文件（省略时视为空列表）",
+    )
+    parser.add_argument(
+        "--sources", metavar="<sources.json>",
+        help="候选来源的 JSON 数组文件（省略时读取 sources/selected_sources.jsonl）",
     )
     parser.add_argument(
         "--apply", dest="apply_path", metavar="<results.json>",
@@ -1637,25 +1641,33 @@ def _build_parser():
 
 def _dispatch(parser, args):
     if args.check_env:
-        if args.root or args.round_no is not None or args.actions or args.apply_path:
-            parser.error("--check-env 不能与 --root/--round/--actions/--apply 同时使用")
+        if (args.root or args.round_no is not None or args.actions
+                or args.sources or args.apply_path):
+            parser.error(
+                "--check-env 不能与 --root/--round/--actions/--sources/--apply 同时使用"
+            )
         return _run_check_env()
 
     if args.apply_path:
-        if args.round_no is not None or args.actions:
-            parser.error("--apply 不能与 --round/--actions 同时使用")
+        if args.round_no is not None or args.actions or args.sources:
+            parser.error("--apply 不能与 --round/--actions/--sources 同时使用")
         if not args.root:
             parser.error("--apply 需要 --root")
         return _run_apply(Path(args.root), Path(args.apply_path))
 
-    if args.round_no is not None or args.actions:
+    if args.round_no is not None or args.actions or args.sources:
         if args.round_no is None:
             parser.error("--round 需要一个轮次编号")
-        if not args.actions:
-            parser.error("--round 需要 --actions")
+        if not args.actions and not args.sources:
+            parser.error("--round 需要 --actions 和/或 --sources")
         if not args.root:
             parser.error("--round 需要 --root")
-        return _run_round_cli(Path(args.root), args.round_no, Path(args.actions))
+        return _run_round_cli(
+            Path(args.root),
+            args.round_no,
+            Path(args.actions) if args.actions else None,
+            Path(args.sources) if args.sources else None,
+        )
 
     parser.error("必须指定 --check-env、--round 或 --apply 之一")
 
@@ -1680,12 +1692,26 @@ def _run_check_env():
     return 0 if ok and not missing else 1
 
 
-def _run_round_cli(root, round_no, actions_path):
-    actions = _read_json(actions_path)
-    if not isinstance(actions, list):
-        raise ValueError(f"{actions_path} 必须是 JSON 数组（候选行动列表）")
+def _run_round_cli(root, round_no, actions_path=None, sources_path=None):
+    """Read the optional input files and run one round.
+
+    ``actions_path`` absent means an empty action list; ``sources_path`` absent
+    is passed through as ``None`` so ``run_round`` reads
+    ``sources/selected_sources.jsonl``, which is how rounds after the first
+    reuse the decisions already recorded there.
+    """
+    actions = []
+    if actions_path is not None:
+        actions = _read_json(actions_path)
+        if not isinstance(actions, list):
+            raise ValueError(f"{actions_path} 必须是 JSON 数组（候选行动列表）")
+    sources = None
+    if sources_path is not None:
+        sources = _read_json(sources_path)
+        if not isinstance(sources, list):
+            raise ValueError(f"{sources_path} 必须是 JSON 数组（候选来源列表）")
     handoff = run_round(root, round_no=round_no, actions=actions,
-                        config=load_config())
+                        config=load_config(), sources=sources)
     _print_json(handoff)
     return 0
 
