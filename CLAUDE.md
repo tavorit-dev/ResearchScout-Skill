@@ -178,22 +178,28 @@ Phase 1～3 是核心能力，4～5 是知识管理与展示，6 是稳定性增
 
 ## 常见命令
 
-尚无代码，以下为约定形态，脚本落地后以实际入口为准：
+前置：Python 3，安装 `requirements.txt` 中的依赖；所有命令在仓库根目录执行。
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 
-# 单轮研究
-python scripts/research_loop.py --research <research_id> --round
-# 合规检查
-python scripts/compliance_gate.py --source <source_id>
-# 重新生成静态查看器
-python scripts/viewer.py --archive archive/
-# 导出
-python scripts/exporter.py --research <research_id> --format csv
+# 环境检查（不写任何文件）
+python3 scripts/research_loop.py --check-env
+
+# 单轮研究：执行一轮（--actions 与 --sources 至少给一个）
+python3 scripts/research_loop.py --root archive/<领域>/<主题> --round <N> \
+  --actions actions.json --sources sources.json
+
+# 宿主回填语义结果后持久化一轮
+python3 scripts/research_loop.py --root archive/<领域>/<主题> --apply results.json
 ```
+
+`scripts/research_loop.py` 是唯一的命令行入口。`planner`、
+`source_discovery`、`compliance_gate`、`exporter` 是模块函数，没有 CLI；调用
+片段见 `SKILL.md` 的 Prerequisites 与 First run 两节。`scripts/viewer.py` 是
+Phase 5 占位，调用时抛出 `NotImplementedError`。
 
 Python 标准库优先；引入第三方依赖需在 `requirements.txt` 中声明并说明理由。
 合规检查、去重、URL 规范化等确定性逻辑的测试不得联网，使用 fixture。
