@@ -315,6 +315,16 @@ class TestPathIsPermitted(unittest.TestCase):
         self.assertTrue(path_is_permitted(
             {"allowed_paths": ["/public/"]}, "https://e.org/public/notes"))
 
+    def test_an_encoded_permission_and_a_plain_target_agree(self):
+        # The gate and the collector must read the same permission the same
+        # way. Both directions are asserted so a fix cannot simply reject
+        # everything: encoded permission/plain target and plain permission/
+        # encoded target both name the same path segment.
+        self.assertTrue(path_is_permitted(
+            {"allowed_paths": ["/%66eed"]}, "https://e.org/feed"))
+        self.assertTrue(path_is_permitted(
+            {"allowed_paths": ["/feed"]}, "https://e.org/%66eed"))
+
     def test_a_root_permission_permits_every_path(self):
         # A web source whose base path is "/" still permits everything
         # beneath it, as it did before this check existed.
@@ -367,12 +377,17 @@ class TestAllowedPaths(unittest.TestCase):
         self.assertEqual(docs, [])
 
     def test_redirect_inside_an_allowed_path_is_accepted(self):
+        # Initial and final addresses must differ, or this exercises no
+        # redirect at all: the point is that a redirect which stays inside the
+        # permitted path is followed and archived.
+        fetcher = text_fetcher(ATOM_FEED,
+                               final_url="https://e.org/public/archive/feed")
         docs = collect(
             source(allowed_paths=["/public"],
                    feed_url="https://e.org/public/feed"),
-            fetcher=text_fetcher(ATOM_FEED,
-                                 final_url="https://e.org/public/feed"),
+            fetcher=fetcher,
         )
+        self.assertEqual(fetcher.calls, ["https://e.org/public/feed"])
         self.assertEqual(len(docs), 2)
 
     def test_no_allowed_paths_means_no_path_restriction(self):

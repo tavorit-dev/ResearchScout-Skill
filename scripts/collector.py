@@ -413,7 +413,7 @@ def _host_of(url):
         return ""
 
 
-def _normalise_path(value):
+def normalise_path(value):
     """Return ``value`` as a decoded, dot-free absolute path, or None.
 
     The comparison must happen on path *segments*, not on a string prefix: as
@@ -427,6 +427,16 @@ def _normalise_path(value):
 
     Returns ``None`` when the path cannot be read safely; the caller treats
     that as "not permitted".
+
+    This is **the** path normalisation for the project: the compliance gate
+    calls it for the robots.txt decision and for the value it writes to
+    ``allowed_paths``, and this module calls it for the candidate and for each
+    recorded permission. Two definitions were how an encoded or dot-segment
+    target asked robots about one path while the collector enforced another.
+    It lives here rather than in ``scripts/lib/`` because the collector is the
+    module that owns ``allowed_paths`` enforcement; the gate imports it from
+    this module, and no new file is needed for a function with one consumer
+    pair.
     """
     if not isinstance(value, str):
         return None
@@ -467,7 +477,7 @@ def path_is_permitted(source, url):
     outside them. Membership is a **segment** comparison after normalisation:
     ``/public`` permits ``/public`` and ``/public/notes`` but not
     ``/publicity``, ``/public-secrets``, ``/public/../secret`` or an encoded
-    form that would change the segment structure (see ``_normalise_path``).
+    form that would change the segment structure (see ``normalise_path``).
 
     An **absent or empty** list means "no path restriction", which is the
     behaviour every source had before this check existed: the schema does not
@@ -510,7 +520,7 @@ def path_is_permitted(source, url):
                 stacklevel=2,
             )
             return False
-        prefix = _normalise_path(entry)
+        prefix = normalise_path(entry)
         if prefix is None:
             warnings.warn(
                 f"allowed_paths entry {entry!r} cannot be normalised; "
@@ -521,7 +531,7 @@ def path_is_permitted(source, url):
             return False
         prefixes.append(prefix)
     try:
-        path = _normalise_path(urlsplit(url or "").path or "/")
+        path = normalise_path(urlsplit(url or "").path or "/")
     except (AttributeError, TypeError, ValueError):
         return False
     if path is None:

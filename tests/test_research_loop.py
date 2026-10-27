@@ -1191,6 +1191,68 @@ class TestRecordedDecisionBoundToItsAddress(TempCase):
         self.assertIn("https://e.org:8443/robots.txt", fetcher.calls)
 
 
+class TestRecordedDecisionBoundToItsTarget(TempCase):
+    """Changing the feed/API address invalidates the decision too (fix round 5).
+
+    ``base_url`` was already bound to the decision. An rss source also names
+    the address it is actually read at, so a decision recorded for ``/feed``
+    must not be reused after the record is re-pointed at another path.
+    """
+
+    def _recorded(self):
+        root = layout_root(self.tmp)
+        unchecked = source()
+        unchecked.pop("checked_at")
+        fetcher = routed_fetcher({
+            "https://e.org": {"outcome": "ok", "status": 200, "text": FEED_ONE},
+            "https://e.org/robots.txt": {
+                "outcome": "ok", "status": 200, "text": ROBOTS_ALLOW},
+            "https://e.org/feed": {
+                "outcome": "ok", "status": 200, "text": FEED_ONE},
+        })
+        run_round(root, round_no=1, actions=[], config={"iteration_policy": {}},
+                  fetcher=fetcher, sources=[unchecked])
+        record = selected_records(root)[0]
+        self.assertEqual(record["feed_url"], "https://e.org/feed")
+        self.assertEqual(record["allowed_paths"], ["/feed"])
+        return root, record
+
+    def test_the_same_target_reuses_the_decision(self):
+        root, record = self._recorded()
+        fetcher = text_fetcher(FEED_ONE)
+
+        handoff = run_round(
+            root, round_no=2, actions=[], config={"iteration_policy": {}},
+            fetcher=fetcher, sources=[dict(record)],
+        )
+
+        # No re-check: the recorded target is the current one. The only
+        # request is the collection of the feed itself.
+        self.assertEqual(fetcher.calls, ["https://e.org/feed"])
+        self.assertEqual(handoff["new_documents"], [])
+
+    def test_a_changed_target_is_rechecked_and_a_disallowed_one_is_refused(self):
+        root, record = self._recorded()
+        fetcher = routed_fetcher({
+            "https://e.org": {"outcome": "ok", "status": 200, "text": FEED_ONE},
+            "https://e.org/robots.txt": {
+                "outcome": "ok", "status": 200,
+                "text": "User-agent: *\nDisallow: /feed/private\n",
+            },
+        })
+
+        handoff = run_round(
+            root, round_no=2, actions=[], config={"iteration_policy": {}},
+            fetcher=fetcher,
+            sources=[dict(record, feed_url="https://e.org/feed/private/x")],
+        )
+
+        self.assertIn("https://e.org/robots.txt", fetcher.calls)
+        self.assertNotIn("https://e.org/feed/private/x", fetcher.calls)
+        self.assertEqual(handoff["new_documents"], [])
+        self.assertEqual(selected_records(root)[0]["compliance_status"], "BLOCKED")
+
+
 class TestRobotsEvaluatesTheFetchedPath(TempCase):
     """robots.txt is consulted for the path that will be read (fix 4, NEW-7)."""
 
@@ -1245,6 +1307,59 @@ class TestRobotsEvaluatesTheFetchedPath(TempCase):
                          ["https://e.org", "https://e.org/robots.txt",
                           "https://e.org/feed"])
         self.assertEqual(selected_records(root)[0]["allowed_paths"], ["/feed"])
+
+
+class TestEncodedTargetCannotBypassRobots(TempCase):
+    """The gate and the collector must agree on one normalised path (fix round 5).
+
+    Before the shared helper, the gate asked robots about the raw target path
+    while the collector compared normalised paths. ``/%73ecret/feed`` and
+    ``/public/../secret/feed`` were therefore ALLOWED, recorded as the raw
+    path, and then fetched and archived.
+    """
+
+    def _run_for(self, target):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = layout_root(tmp)
+            unchecked = source()
+            unchecked.pop("checked_at")
+            fetcher = routed_fetcher({
+                "https://e.org": {"outcome": "ok", "status": 200,
+                                  "text": FEED_ONE},
+                "https://e.org/robots.txt": {
+                    "outcome": "ok", "status": 200,
+                    "text": "User-agent: *\nDisallow: /secret\n",
+                },
+            })
+            handoff = run_round(
+                root, round_no=1, actions=[],
+                config={"iteration_policy": {}}, fetcher=fetcher,
+                sources=[dict(unchecked, feed_url=target)],
+            )
+            return fetcher, handoff, selected_records(root)[0]
+
+    def test_an_encoded_target_is_blocked_without_fetching_the_feed(self):
+        target = "https://e.org/%73ecret/feed"
+        fetcher, handoff, stored = self._run_for(target)
+
+        self.assertEqual(handoff["new_documents"], [])
+        self.assertNotIn(target, fetcher.calls)
+        # Only the source's own origin was consulted.
+        self.assertEqual(fetcher.calls,
+                         ["https://e.org", "https://e.org/robots.txt"])
+        self.assertEqual(stored["compliance_status"], "BLOCKED")
+        self.assertEqual(stored["allowed_paths"], [])
+
+    def test_a_dot_segment_target_is_blocked_without_fetching_the_feed(self):
+        target = "https://e.org/public/../secret/feed"
+        fetcher, handoff, stored = self._run_for(target)
+
+        self.assertEqual(handoff["new_documents"], [])
+        self.assertNotIn(target, fetcher.calls)
+        self.assertEqual(fetcher.calls,
+                         ["https://e.org", "https://e.org/robots.txt"])
+        self.assertEqual(stored["compliance_status"], "BLOCKED")
+        self.assertEqual(stored["allowed_paths"], [])
 
 
 class TestSelectionStatus(TempCase):
@@ -1308,6 +1423,47 @@ class TestMisconfiguredSourceIsPersistedAsRefused(TempCase):
         self.assertNotEqual(stored["src_bad"]["compliance_status"], "ALLOWED")
         self.assertEqual(stored["src_bad"]["selection_status"], "pending")
         validate_record("source", stored["src_bad"])
+
+    def test_a_corrected_feed_url_is_rechecked_and_then_collected(self):
+        # A refusal for a configuration reason must not leave a decision
+        # marker behind: otherwise every later round sees ``checked_at``,
+        # trusts the ERROR, and never looks at the repaired record.
+        root = layout_root(self.tmp)
+        missing = source(source_id="src_repaired")
+        missing.pop("checked_at")
+        missing.pop("feed_url")
+
+        first = routed_fetcher({
+            "https://e.org": {"outcome": "ok", "status": 200, "text": FEED_ONE},
+            "https://e.org/robots.txt": {
+                "outcome": "ok", "status": 200, "text": ROBOTS_ALLOW},
+        })
+        run_round(root, round_no=1, actions=[], config={"iteration_policy": {}},
+                  fetcher=first, sources=[missing])
+
+        refused = selected_records(root)[0]
+        self.assertEqual(refused["compliance_status"], "ERROR")
+        self.assertFalse(refused.get("checked_at"))
+
+        corrected = dict(refused, feed_url="https://e.org/feed")
+        second = routed_fetcher({
+            "https://e.org": {"outcome": "ok", "status": 200, "text": FEED_ONE},
+            "https://e.org/robots.txt": {
+                "outcome": "ok", "status": 200, "text": ROBOTS_ALLOW},
+            "https://e.org/feed": {
+                "outcome": "ok", "status": 200, "text": FEED_ONE},
+        })
+        handoff = run_round(root, round_no=2, actions=[],
+                            config={"iteration_policy": {}},
+                            fetcher=second, sources=[corrected])
+
+        # The gate ran again, and the repaired source was collected.
+        self.assertIn("https://e.org/robots.txt", second.calls)
+        self.assertIn("https://e.org/feed", second.calls)
+        self.assertEqual(len(handoff["new_documents"]), 1)
+        stored = selected_records(root)[0]
+        self.assertEqual(stored["compliance_status"], "ALLOWED")
+        self.assertTrue(stored["checked_at"])
 
 
 class TestNonMappingAction(TempCase):

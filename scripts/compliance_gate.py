@@ -22,6 +22,7 @@ collection; it is not a licence.
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
+from scripts.collector import normalise_path
 from scripts.lib.http import fetch
 from scripts.lib.robots import evaluate_robots, parse_robots
 
@@ -201,13 +202,56 @@ def _terms_decision(source):
 
 
 def _robot_path(url):
-    """Return the path of ``url``, used for the robots.txt rule query."""
+    """Return the normalised path of ``url``, or None when unreadable.
+
+    This is the **one** path the gate decides on and records. It calls
+    ``collector.normalise_path`` so the gate and the collector cannot disagree
+    about the address being asked about: percent-encoded segments are decoded
+    and dot segments removed before robots.txt is consulted, and the value
+    written to ``allowed_paths`` is the same normalised path the collector
+    will enforce. Evaluating the raw path here was how ``/%73ecret`` and
+    ``/public/../secret`` passed the gate and were then fetched.
+
+    ``None`` means the path cannot be read safely (a non-string, an
+    unparseable URL, or a segment that decodes to contain ``/``). The callers
+    treat that as a refusal, never as the root path.
+    """
     if not isinstance(url, str):
-        return ROOT_PATH
+        return None
     try:
-        return urlsplit(url).path or ROOT_PATH
+        raw_path = urlsplit(url).path or ROOT_PATH
     except ValueError:
-        return ROOT_PATH
+        return None
+    return normalise_path(raw_path)
+
+
+def _origin_of(url):
+    """Return ``(scheme, host, port)`` for url, or None when unreadable.
+
+    The origin -- not the host -- is the unit robots.txt is defined for, so a
+    scheme or port change is a different rules context just as much as a
+    different host is.
+    """
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except (TypeError, ValueError):
+        return None
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if not scheme or not host:
+        return None
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return scheme, host, port
+
+
+def _same_origin(left, right):
+    """Return True when both URLs name the same scheme, host and port."""
+    left_origin = _origin_of(left)
+    return left_origin is not None and left_origin == _origin_of(right)
 
 
 def check_compliance(source, *, fetcher=None, config=None, target_url=None):
@@ -238,14 +282,25 @@ def check_compliance(source, *, fetcher=None, config=None, target_url=None):
 
     ``target_url`` is the address the collector will actually read (a feed or
     API address, or the base URL for a web source). When it is given, the
-    robots decision is made for **that URL's path**, not for the base URL's:
-    robots.txt is evaluated per path, and the path that matters is the one
-    that will be requested. ``allowed_paths`` then records the path the gate
-    evaluated and permitted, so the collector's own path check enforces
-    something meaningful. When ``target_url`` is absent the base URL's path is
+    robots decision is made for **that URL's normalised path**, not for the
+    base URL's: robots.txt is evaluated per path, and the path that matters is
+    the one that will be requested. ``collector.normalise_path`` is used for
+    both the decision and the value written to ``allowed_paths``, so an
+    encoded or dot-segment address is judged as the path the collector will
+    actually enforce. When ``target_url`` is absent the base URL's path is
     evaluated, which is the pre-existing behaviour. The gate still records the
     checked ``base_url`` (as evidence), not the target address: consent is for
     the source's address, and the target is one request within it.
+
+    The target must share the base URL's origin (scheme, host, port). robots.txt
+    for ``e.org`` says nothing about ``evil.example``, so an off-origin target
+    is marked ``ERROR`` with no recorded path -- the same way a
+    misconfiguration is marked -- and no decision marker is written. The
+    collector's own off-host refusal is the second line of defence.
+
+    Two configuration failures write ``checked_at`` of ``None``: an unreadable
+    target path and an off-origin target. No decision was made for those
+    records, so the next round must not reuse whatever status they carry.
     """
     source = source or {}
     fetcher = fetcher or _default_fetcher
@@ -257,8 +312,11 @@ def check_compliance(source, *, fetcher=None, config=None, target_url=None):
     evidence = []
     notes = []
     # The path robots.txt is asked about: the request that will be made when
-    # the caller says what it is, the base URL's path otherwise.
-    evaluated_path = _robot_path(target_url if target_url else base_url)
+    # the caller says what it is, the base URL's path otherwise. It is
+    # normalised by the same helper the collector uses, so the answer and the
+    # recorded permission describe the path that will actually be enforced.
+    target = target_url if target_url else base_url
+    evaluated_path = _robot_path(target)
 
     record = {
         "source_id": source.get("source_id"),
@@ -273,6 +331,21 @@ def check_compliance(source, *, fetcher=None, config=None, target_url=None):
         "evidence": evidence,
         "notes": "",
     }
+
+    # A path that cannot be normalised cannot be asked about: evaluating the
+    # root instead would widen the check to a path the caller never named.
+    # This is a configuration failure, not a permission decision, so it carries
+    # no decision marker and records no permitted path.
+    if evaluated_path is None:
+        record["compliance_status"] = STATUS_ERROR
+        record["checked_at"] = None
+        notes.append(
+            f"the path of {target!r} cannot be normalised; robots.txt cannot "
+            f"be asked about it and no path is permitted"
+        )
+        evidence.append(_address_evidence(base_url))
+        record["notes"] = "; ".join(notes)
+        return record
 
     # Step 1: reachability. An address that does not answer is not checked
     # further and is not collected from.
@@ -307,8 +380,28 @@ def check_compliance(source, *, fetcher=None, config=None, target_url=None):
         notes.append(f"robots.txt Crawl-delay sets the request interval to {crawl_delay}s")
     effective_rate_limit = record["request_rate_limit"]
 
-    # Step 3: the decision, in the fixed priority order above.
-    if robots_status == "error":
+    # Step 3: the decision, in the fixed priority order above. An off-origin
+    # target comes first: robots.txt was consulted for the source's origin, and
+    # that answer does not cover another origin. No path is recorded for it,
+    # and no decision marker is written, because no decision was made about
+    # this target. The collector's off-host refusal remains the second line.
+    if target_url and not _same_origin(base_url, target_url):
+        record["compliance_status"] = STATUS_ERROR
+        record["checked_at"] = None
+        evidence.append(
+            _evidence(
+                "target_origin",
+                target_url,
+                "target origin differs from the base URL's origin",
+                "robots.txt for the base origin does not cover this target; "
+                "no path is recorded",
+            )
+        )
+        notes.append(
+            f"target {target_url!r} is on a different origin from base URL "
+            f"{base_url!r}; no robots decision was made for it"
+        )
+    elif robots_status == "error":
         record["compliance_status"] = STATUS_ERROR
         notes.append("the rules could not be read, so the source is suspended (not allowed)")
     elif robots_status == "blocked":

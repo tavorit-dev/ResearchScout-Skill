@@ -219,7 +219,8 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
        **or when its recorded decision was made for another address**: the
        record is bound to the ``domain`` and the checked address the gate
        wrote, so carrying ``checked_at`` from an e.org decision while pointing
-       ``base_url`` at another host, scheme, port or path triggers a fresh
+       ``base_url`` at another host, scheme, port or path -- or an rss/api
+       source's ``feed_url``/``api_url`` at another address -- triggers a fresh
        check instead of reusing a consent for an address it never covered. The
        gate is given the collector's target address (``target_url``), so
        robots.txt is evaluated for the path that will actually be fetched. A
@@ -1023,6 +1024,48 @@ def _base_url_of(record):
     return None
 
 
+# The field naming the address an access method actually reads. A web source
+# is read at ``base_url``, whose binding the address comparison already
+# enforces; rss and api sources name a separate transport address.
+TARGET_FIELDS = {"rss": "feed_url", "api": "api_url"}
+
+
+def _target_field(source):
+    """Return the source field naming its target address, or None."""
+    method = (source.get("access_method") or "").strip().lower()
+    return TARGET_FIELDS.get(method)
+
+
+def _target_matches(source, recorded):
+    """Return True when the current target address matches the recorded one.
+
+    The gate's ``allowed_paths`` were computed for the target address it was
+    given, so a record re-pointed at another feed or API address must be
+    re-checked even when its ``base_url`` is unchanged. The archived record is
+    the evidence of which target was checked; an in-memory copy alone cannot
+    prove one, which is the same reason ``_decision_applies`` compares the
+    archived ``base_url``.
+
+    For a source whose archive carries no ``feed_url``/``api_url`` there is
+    nothing to compare, so only the base binding applies. A target that is now
+    missing, or one that cannot be normalised, cannot be proven equal and is
+    re-checked -- the fail-safe direction.
+    """
+    field = _target_field(source)
+    if field is None:
+        return True
+    current = source.get(field)
+    previous = recorded.get(field) if isinstance(recorded, dict) else None
+    if not isinstance(previous, str) or not previous.strip():
+        return True
+    if not isinstance(current, str) or not current.strip():
+        return False
+    try:
+        return normalize_url(current.strip()) == normalize_url(previous.strip())
+    except (TypeError, ValueError):
+        return False
+
+
 def _decision_applies(source, recorded=None):
     """Return True when a recorded decision was made for this address.
 
@@ -1040,7 +1083,11 @@ def _decision_applies(source, recorded=None):
     * the recorded address is present and equal to the current ``base_url``
       after ``normalize_url``. A normalisation failure (an unreadable port,
       for example) means the two cannot be proven equal and the source is
-      re-checked.
+      re-checked;
+    * for an rss or api source, the recorded ``feed_url``/``api_url`` equals
+      the current one after ``normalize_url`` (``_target_matches``). The
+      decision's ``allowed_paths`` were computed for that address, so changing
+      the target without changing the base URL is still a different consent.
 
     ``recorded`` is the source's record as stored in
     ``sources/selected_sources.jsonl`` before this round, when one exists.
@@ -1065,6 +1112,8 @@ def _decision_applies(source, recorded=None):
     if not host or recorded_domain.strip().lower() != host:
         return False
     if not isinstance(current_base, str) or not current_base.strip():
+        return False
+    if not _target_matches(source, recorded):
         return False
 
     recorded_bases = []
@@ -1160,10 +1209,25 @@ def _refused_record(source, error):
     while the file still claimed it was permitted. The record is written back
     as ``ERROR``/``pending`` with the reason in ``notes``; the source stays
     visible for a human to repair, but it no longer looks collectable.
+
+    ``checked_at`` is cleared as well. It is the marker that tells the next
+    round a decision already applies, but no permission decision was made
+    here -- the collector refused the record's *configuration*. Leaving the
+    marker would make ``_decision_applies`` reuse this ERROR on every later
+    round, so a repaired ``feed_url`` would never be checked and the source
+    could never recover. Clearing it makes the next round re-run the gate,
+    which is the behaviour the docstring above promises the user.
     """
     record = dict(source)
     record["compliance_status"] = STATUS_ERROR
     record["selection_status"] = "pending"
+    # No decision was made about a source whose configuration the collector
+    # refused, so the record must not carry the decision marker. Keeping
+    # ``checked_at`` would make the next round reuse this ERROR forever, and a
+    # user who repairs the record would never get a new check. The robots
+    # evidence is kept as history of what the gate saw; it is the marker, not
+    # the evidence, that authorises reuse.
+    record["checked_at"] = None
     note = f"collection refused for a configuration reason: {error}"
     existing = record.get("notes")
     if isinstance(existing, str) and existing.strip():
