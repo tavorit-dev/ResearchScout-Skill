@@ -24,16 +24,20 @@ caller that owns them:
   ``ftp://`` address can arrive here as a source with ``access_method`` of
   ``web``. Such an address is never handed to ``fetch``.
 * The target is bound to the source's own host. An RSS or API source names a
-  dedicated address in ``feed_url``/``api_url``; the compliance gate checks
-  ``base_url``, so a target on another host would turn one consent into a
-  fetch of an arbitrary site. A mismatch is a misconfiguration, not a
-  transient failure, and raises ``ValueError`` naming both hosts before any
-  request. ``collect`` is a public entry point, so this check lives here as
-  well as in the research loop (defence in depth, invariant 1).
-* ``allowed_paths`` is enforced on the final URL. The schema says the
-  collector must not go outside the paths the gate recorded, so a redirect to
-  a disallowed path on the same host is refused rather than archived. An
-  absent or empty list keeps the older behaviour of no path restriction.
+  dedicated address in ``feed_url``/``api_url``; the compliance decision is
+  made for the source's ``base_url`` (and for the target's path), so a target
+  on another host would turn one consent into a fetch of an arbitrary site. A
+  mismatch is a misconfiguration, not a transient failure, and raises
+  ``ValueError`` naming both hosts before any request. An rss/api source with
+  no non-empty transport address raises the same way rather than silently
+  collecting nothing. ``collect`` is a public entry point, so these checks
+  live here as well as in the research loop (defence in depth, invariant 1).
+* ``allowed_paths`` is enforced on the target address **before** the request
+  and again on the final URL. The schema says the collector must not go
+  outside the paths the gate recorded, so a request to a disallowed path is
+  never made, and a redirect to a disallowed path on the same host is refused
+  rather than archived. An absent or empty list keeps the older behaviour of
+  no path restriction.
 
 Known v1 limitation, accepted rather than fixed here: the redirect re-check
 does not re-consult robots.txt for the redirected path. A redirect from a
@@ -54,10 +58,12 @@ does not upgrade the mode on its own.
 Everything fetched is untrusted input (spec 10.5). It is stored and parsed as
 data; nothing in this module executes it or reads an instruction out of it.
 """
+import warnings
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlsplit
+from posixpath import normpath
+from urllib.parse import unquote, urlsplit
 
 from scripts.lib.hashing import content_hash
 from scripts.lib.http import DEFAULT_DELAY, fetch
@@ -364,19 +370,25 @@ def parse_feed(text):
     return items
 
 
-def _target_url(source):
+def target_url(source):
     """Return the address to read for this source.
 
     A source that names a dedicated feed or API address is read there;
     otherwise the base URL is read. Nothing here walks a site looking for
     links: one source is one address.
+
+    This is public because the compliance gate must evaluate the path that
+    will actually be fetched, and ``scripts.research_loop`` hands this same
+    address to ``check_compliance`` so the gate and the collector cannot
+    disagree about where the request goes.
     """
-    method = (source or {}).get("access_method") or ""
+    source = source or {}
+    method = source.get("access_method") or ""
     if method == ACCESS_METHOD_RSS:
-        return (source or {}).get("feed_url") or ""
+        return source.get("feed_url") or ""
     if method == ACCESS_METHOD_API:
-        return (source or {}).get("api_url") or ""
-    return (source or {}).get("base_url") or ""
+        return source.get("api_url") or ""
+    return source.get("base_url") or ""
 
 
 def _scheme_allowed(url):
@@ -401,39 +413,120 @@ def _host_of(url):
         return ""
 
 
+def _normalise_path(value):
+    """Return ``value`` as a decoded, dot-free absolute path, or None.
+
+    The comparison must happen on path *segments*, not on a string prefix: as
+    a string, ``/publicity`` starts with ``/public`` while being a different
+    path. Each raw segment is percent-decoded first, so ``/p%75blic`` is the
+    permitted ``/public``. A segment that decodes to contain ``/`` is refused
+    rather than decoded into two segments: the raw path's boundaries would no
+    longer describe the path the server receives, and widening a permission
+    on that basis is the wrong direction. Dot segments are removed last, so
+    ``/public/../secret`` becomes ``/secret`` and falls outside the grant.
+
+    Returns ``None`` when the path cannot be read safely; the caller treats
+    that as "not permitted".
+    """
+    if not isinstance(value, str):
+        return None
+    raw_segments = value.split("/")
+    segments = []
+    for raw in raw_segments:
+        decoded = unquote(raw)
+        if "/" in decoded:
+            # An encoded separator would change the segment structure.
+            return None
+        segments.append(decoded)
+    path = "/".join(segments)
+    if not path.startswith("/"):
+        path = "/" + path
+    normalised = normpath(path)
+    if not normalised.startswith("/"):
+        normalised = "/" + normalised
+    return normalised
+
+
+def _path_within(path, prefix):
+    """Return True when ``path`` equals ``prefix`` or is beneath it.
+
+    ``/`` is the whole tree: a source whose permitted path is the root still
+    permits everything beneath it, which is what a web source with a ``/``
+    base path has always meant.
+    """
+    if prefix == "/":
+        return True
+    return path == prefix or path.startswith(prefix + "/")
+
+
 def path_is_permitted(source, url):
     """Return True when ``url``'s path is inside the source's allowed paths.
 
     ``allowed_paths`` is the gate's record of the paths it permitted, and
     ``schemas/source.schema.json`` is explicit that the collector must not go
-    outside them. Membership is a literal prefix match on the parsed path, so
-    ``/public`` permits ``/public`` and ``/public/notes`` but not ``/secret``.
-    The prefixes are compared as recorded -- a caller that writes
-    ``public`` without a leading slash gets a prefix that matches no absolute
-    path, which fails closed rather than silently widening the permission.
+    outside them. Membership is a **segment** comparison after normalisation:
+    ``/public`` permits ``/public`` and ``/public/notes`` but not
+    ``/publicity``, ``/public-secrets``, ``/public/../secret`` or an encoded
+    form that would change the segment structure (see ``_normalise_path``).
 
-    An absent, empty or unusable list means "no path restriction", which is
-    the behaviour every source had before this check existed: the schema does
-    not require ``allowed_paths``, and a source without one has no narrower
-    grant to enforce. A URL whose path cannot be parsed is refused rather than
-    read as unrestricted.
+    An **absent or empty** list means "no path restriction", which is the
+    behaviour every source had before this check existed: the schema does not
+    require ``allowed_paths``, and a source without one has no narrower grant
+    to enforce. An absent key and a ``None`` value are both "absent".
+
+    A **non-empty value that is not a list of non-empty strings** is a
+    permission that cannot be read -- a bare string, ``[123]``, ``[""]``. It is
+    refused (``False``) and a ``RuntimeWarning`` says why. Reading an
+    unreadable permission as "no restriction" would turn a mistake into a
+    wider grant, which is the direction a compliance check must never take.
+
+    A URL whose path cannot be parsed is refused rather than read as
+    unrestricted.
 
     The helper is public because ``scripts.research_loop`` enforces the same
     rule on the page-extraction path; one definition keeps the two paths from
     drifting apart.
     """
     allowed = (source or {}).get("allowed_paths")
+    if allowed is None:
+        return True
     if not isinstance(allowed, list):
-        return True
-    prefixes = [entry for entry in allowed
-                if isinstance(entry, str) and entry]
-    if not prefixes:
-        return True
-    try:
-        path = urlsplit(url or "").path or "/"
-    except ValueError:
+        warnings.warn(
+            f"allowed_paths is a {type(allowed).__name__}, not a list of "
+            f"non-empty strings; refusing the path (fail closed)",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return False
-    return any(path.startswith(prefix) for prefix in prefixes)
+    if not allowed:
+        return True
+    prefixes = []
+    for entry in allowed:
+        if not isinstance(entry, str) or not entry:
+            warnings.warn(
+                f"allowed_paths contains {entry!r}, which is not a non-empty "
+                f"string; refusing the path (fail closed)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return False
+        prefix = _normalise_path(entry)
+        if prefix is None:
+            warnings.warn(
+                f"allowed_paths entry {entry!r} cannot be normalised; "
+                f"refusing the path (fail closed)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return False
+        prefixes.append(prefix)
+    try:
+        path = _normalise_path(urlsplit(url or "").path or "/")
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if path is None:
+        return False
+    return any(_path_within(path, prefix) for prefix in prefixes)
 
 
 def _delay_for(source, config):
@@ -516,26 +609,28 @@ def collect(source, *, fetcher=None, config=None):
     """Return the candidate documents collected from one permitted source.
 
     The order is fixed and the compliance block comes first: assert, resolve
-    the address, check the scheme, fetch once, re-check where the fetch ended
-    up, then build one document per feed entry. A source that is not
-    ``ALLOWED`` raises ``PermissionError`` before any of that, so a refused or
-    undecided source never reaches the transport (invariant 1, acceptance V2).
+    the address, check that an rss/api source has its transport address, check
+    the scheme and host, check the target path, fetch once, re-check where the
+    fetch ended up, then build one document per feed entry. A source that is
+    not ``ALLOWED`` raises ``PermissionError`` before any of that, so a
+    refused or undecided source never reaches the transport (invariant 1,
+    acceptance V2).
 
     Failures are returned as an empty list rather than raised: an unreachable
     source is a source with nothing to collect this round, not a crash. A
     refused fetch is not retried, because asking again is how a client tries to
     get past a refusal (spec 10.4).
 
-    One failure is deliberately loud. A target address on a different host
-    from the source's ``base_url`` raises ``ValueError`` before any request:
-    the gate decided about ``base_url``, so consent for that host cannot
-    authorise a fetch of another. This is a broken source record, not a
-    transient condition, and returning an empty list would hide a compliance
-    violation. The research loop records it in ``actions_rejected`` and keeps
-    the round going.
+    Two failures are deliberately loud. A target address on a different host
+    from the source's ``base_url``, and an rss/api source with no non-empty
+    transport address, raise ``ValueError`` before any request: the first is
+    consent being stretched to another site, the second is a broken record
+    that would otherwise look like "nothing to collect" forever. The research
+    loop records both in ``actions_rejected`` and keeps the round going.
 
-    A fetch that redirects onto a path outside ``allowed_paths`` yields no
-    documents, for the same reason: the gate did not permit that path.
+    A target path outside ``allowed_paths`` yields no documents without a
+    request, and a fetch that redirects onto such a path is discarded after
+    the fact, for the same reason: the gate did not permit that path.
 
     ``retention_mode`` is set deliberately and defaults to ``reference``: the
     link, the metadata the feed stated, and a fingerprint. Keeping a body is
@@ -550,10 +645,25 @@ def collect(source, *, fetcher=None, config=None):
     assert_compliance_allows(source)
 
     fetcher = fetcher or _default_fetcher
-    target_url = _target_url(source)
-    if not target_url:
+    address = target_url(source)
+    method = (source.get("access_method") or "").strip()
+    if method in (ACCESS_METHOD_RSS, ACCESS_METHOD_API):
+        # An rss or api source is read at a dedicated address; there is no
+        # silent fallback to base_url. A missing transport address is a
+        # misconfiguration: returning an empty list would look like "nothing
+        # to collect this round" and would be re-tried forever (fix 4, NEW-6).
+        field = "feed_url" if method == ACCESS_METHOD_RSS else "api_url"
+        if not isinstance(address, str) or not address.strip():
+            raise ValueError(
+                f"source {source.get('source_id')!r} is misconfigured: "
+                f"access_method {method!r} requires a non-empty {field!r}; "
+                f"an absent transport address is not a fallback to base_url"
+            )
+    if not address:
         return []
-    if not _scheme_allowed(target_url):
+    if not isinstance(address, str):
+        return []
+    if not _scheme_allowed(address):
         # A non-http(s) address is skipped with a reason, not handed to the
         # transport: this project has no compliance story for another protocol.
         return []
@@ -564,19 +674,26 @@ def collect(source, *, fetcher=None, config=None):
     # compliance violation must be loud, not an empty result the caller can
     # read as "nothing to collect".
     base_host = _host_of(source.get("base_url"))
-    requested_host = _host_of(target_url)
+    requested_host = _host_of(address)
     if not base_host or not requested_host or requested_host != base_host:
         raise ValueError(
             f"source {source.get('source_id')!r} is misconfigured: its target "
-            f"{target_url!r} is on host {requested_host or '<unreadable>'!r} "
+            f"{address!r} is on host {requested_host or '<unreadable>'!r} "
             f"but its base URL {source.get('base_url')!r} is on host "
             f"{base_host or '<unreadable>'!r}; the compliance decision covers "
             f"the base host only (invariant 1)"
         )
 
+    # The address itself must be inside the paths the gate permitted. Checking
+    # it here is not the same as checking where the fetch ended up: a request
+    # to a path outside the grant is already the violation, whether or not its
+    # response is later discarded (fix 4, NEW-5).
+    if not path_is_permitted(source, address):
+        return []
+
     retrieved_at = _now_iso()
     delay = _delay_for(source, config)
-    result = _fetch_once(fetcher, target_url, config, delay)
+    result = _fetch_once(fetcher, address, config, delay)
     result = result or {}
     if result.get("outcome") != "ok":
         return []
@@ -584,7 +701,7 @@ def collect(source, *, fetcher=None, config=None):
     # ``final_url`` is where the request ended up. The real transport always
     # fills it in; an injected fetcher may omit it, and a missing value is read
     # as "no redirect happened" -- the request ended where it was sent.
-    final_url = result.get("final_url") or target_url
+    final_url = result.get("final_url") or address
     # The redirect is re-checked rather than trusted. A fetch that ended on a
     # different host -- or on a scheme this collector does not speak, or on an
     # address whose host cannot be read at all -- did not come from the source

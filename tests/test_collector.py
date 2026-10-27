@@ -1,7 +1,8 @@
 # tests/test_collector.py
 import unittest
 from pathlib import Path
-from scripts.collector import parse_feed, collect, assert_compliance_allows
+from scripts.collector import (assert_compliance_allows, collect, parse_feed,
+                               path_is_permitted)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_feed.xml"
 
@@ -277,10 +278,89 @@ class TestTargetHostBoundToTheSource(unittest.TestCase):
         self.assertEqual(len(docs), 2)
 
 
+class TestPathIsPermitted(unittest.TestCase):
+    """``allowed_paths`` is a segment boundary, not a string prefix (fix 4, NEW-1)."""
+
+    def permitted(self, url):
+        return path_is_permitted({"allowed_paths": ["/public"]}, url)
+
+    def test_the_prefix_itself_is_permitted(self):
+        self.assertTrue(self.permitted("https://e.org/public"))
+
+    def test_a_descendant_segment_is_permitted(self):
+        self.assertTrue(self.permitted("https://e.org/public/notes"))
+
+    def test_a_longer_segment_name_is_not_a_descendant(self):
+        # "/publicity" starts with "/public" as a string but not as a path.
+        self.assertFalse(self.permitted("https://e.org/publicity"))
+
+    def test_a_dash_suffix_is_not_a_descendant(self):
+        self.assertFalse(self.permitted("https://e.org/public-secrets"))
+
+    def test_dot_segments_are_removed_before_the_comparison(self):
+        self.assertFalse(self.permitted("https://e.org/public/../secret"))
+
+    def test_an_encoded_separator_is_refused(self):
+        # %2F would become a separator after decoding, so the raw segment
+        # boundaries no longer describe the path being compared. Refuse.
+        self.assertFalse(self.permitted("https://e.org/public%2Fsecret"))
+
+    def test_an_encoded_letter_is_decoded(self):
+        # Percent-decoding is not only a defence: "/p%75blic" is "/public".
+        self.assertTrue(self.permitted("https://e.org/p%75blic/notes"))
+
+    def test_a_trailing_slash_on_the_permission_does_not_widen_it(self):
+        self.assertFalse(path_is_permitted(
+            {"allowed_paths": ["/public/"]}, "https://e.org/publicity"))
+        self.assertTrue(path_is_permitted(
+            {"allowed_paths": ["/public/"]}, "https://e.org/public/notes"))
+
+    def test_a_root_permission_permits_every_path(self):
+        # A web source whose base path is "/" still permits everything
+        # beneath it, as it did before this check existed.
+        for url in ("https://e.org/", "https://e.org/anywhere/at/all"):
+            with self.subTest(url=url):
+                self.assertTrue(path_is_permitted(
+                    {"allowed_paths": ["/"]}, url))
+
+    def test_an_absent_or_empty_list_means_no_restriction(self):
+        for source in ({}, {"allowed_paths": None}, {"allowed_paths": []}):
+            with self.subTest(source=source):
+                self.assertTrue(path_is_permitted(source, "https://e.org/x"))
+
+    def test_a_malformed_permission_fails_closed_and_says_why(self):
+        # A permission the tool cannot read is not "no restriction".
+        for allowed, url in (
+            ("public", "https://e.org/public"),
+            ([""], "https://e.org/anywhere"),
+            ([123], "https://e.org/anywhere"),
+            (["/public", 123], "https://e.org/public"),
+            (123, "https://e.org/anywhere"),
+        ):
+            with self.subTest(allowed=allowed):
+                with self.assertWarns(RuntimeWarning) as caught:
+                    self.assertFalse(path_is_permitted(
+                        {"allowed_paths": allowed}, url))
+                self.assertIn("allowed_paths", str(caught.warning))
+
+
 class TestAllowedPaths(unittest.TestCase):
+    def test_the_initial_target_outside_the_allowed_path_is_not_requested(self):
+        # The request itself is the violation: the target path is checked
+        # before the transport is touched (fix 4, NEW-5).
+        fetcher = text_fetcher(ATOM_FEED)
+        docs = collect(
+            source(allowed_paths=["/public"],
+                   feed_url="https://e.org/secret/feed"),
+            fetcher=fetcher,
+        )
+        self.assertEqual(docs, [])
+        self.assertEqual(fetcher.calls, [])
+
     def test_redirect_into_a_disallowed_path_is_refused(self):
         docs = collect(
-            source(allowed_paths=["/public"]),
+            source(allowed_paths=["/public"],
+                   feed_url="https://e.org/public/feed"),
             fetcher=text_fetcher(ATOM_FEED,
                                  final_url="https://e.org/secret/feed"),
         )
@@ -288,7 +368,8 @@ class TestAllowedPaths(unittest.TestCase):
 
     def test_redirect_inside_an_allowed_path_is_accepted(self):
         docs = collect(
-            source(allowed_paths=["/public"]),
+            source(allowed_paths=["/public"],
+                   feed_url="https://e.org/public/feed"),
             fetcher=text_fetcher(ATOM_FEED,
                                  final_url="https://e.org/public/feed"),
         )
@@ -301,6 +382,40 @@ class TestAllowedPaths(unittest.TestCase):
                                  final_url="https://e.org/anywhere/feed"),
         )
         self.assertEqual(len(docs), 2)
+
+
+class TestMissingTransportAddress(unittest.TestCase):
+    """rss/api without their address is a misconfiguration, not an empty feed."""
+
+    def test_rss_with_an_empty_feed_url_raises(self):
+        fetcher = text_fetcher(ATOM_FEED)
+        with self.assertRaises(ValueError) as caught:
+            collect(source(feed_url=""), fetcher=fetcher)
+        self.assertEqual(fetcher.calls, [])
+        self.assertIn("feed_url", str(caught.exception))
+        self.assertIn("src_1", str(caught.exception))
+
+    def test_rss_with_an_absent_feed_url_raises(self):
+        absent = source()
+        absent.pop("feed_url")
+        fetcher = text_fetcher(ATOM_FEED)
+        with self.assertRaises(ValueError) as caught:
+            collect(absent, fetcher=fetcher)
+        self.assertEqual(fetcher.calls, [])
+        self.assertIn("feed_url", str(caught.exception))
+
+    def test_api_without_an_api_url_raises(self):
+        fetcher = text_fetcher(ATOM_FEED)
+        with self.assertRaises(ValueError) as caught:
+            collect(source(access_method="api", feed_url="", api_url=""),
+                    fetcher=fetcher)
+        self.assertEqual(fetcher.calls, [])
+        self.assertIn("api_url", str(caught.exception))
+
+    def test_a_web_source_reads_its_base_url_without_a_transport_address(self):
+        fetcher = text_fetcher(ATOM_FEED)
+        collect(source(access_method="web", feed_url=""), fetcher=fetcher)
+        self.assertEqual(fetcher.calls, ["https://e.org"])
 
 
 class TestFailedFetchYieldsNothing(unittest.TestCase):

@@ -116,6 +116,23 @@ def _evidence(kind, url, detail, note):
     return {"type": kind, "url": url, "detail": detail, "note": note}
 
 
+def _address_evidence(base_url):
+    """Record the address this decision was made for.
+
+    A decision is consent for an address, not for a host: scheme, port and
+    base path are all part of what robots.txt was consulted about. The source
+    record's own ``base_url`` can be edited later, so the checked address is
+    recorded as evidence; ``research_loop`` reuses a decision only when it
+    still matches this value.
+    """
+    return _evidence(
+        "base_url",
+        base_url,
+        "the address this compliance decision was made for",
+        "a recorded decision is reused only for this address",
+    )
+
+
 def _default_fetcher(url, *, timeout, max_bytes, delay):
     """Fetch through the real transport, applying the configured limits."""
     return fetch(url, timeout=timeout, max_bytes=max_bytes, delay=delay)
@@ -183,15 +200,17 @@ def _terms_decision(source):
     )
 
 
-def _robot_path(base_url):
-    """Return the path of base_url, used for the robots.txt rule query."""
+def _robot_path(url):
+    """Return the path of ``url``, used for the robots.txt rule query."""
+    if not isinstance(url, str):
+        return ROOT_PATH
     try:
-        return urlsplit(base_url or "").path or ROOT_PATH
+        return urlsplit(url).path or ROOT_PATH
     except ValueError:
         return ROOT_PATH
 
 
-def check_compliance(source, *, fetcher=None, config=None):
+def check_compliance(source, *, fetcher=None, config=None, target_url=None):
     """Check one source and return its compliance record (spec 6.7).
 
     Order is reachability, then robots.txt, then the status decision, then the
@@ -216,6 +235,17 @@ def check_compliance(source, *, fetcher=None, config=None):
     requests: when robots.txt publishes a Crawl-delay the gate re-requests the
     base URL at that interval, so the pacing reaches the transport instead of
     living only in the record.
+
+    ``target_url`` is the address the collector will actually read (a feed or
+    API address, or the base URL for a web source). When it is given, the
+    robots decision is made for **that URL's path**, not for the base URL's:
+    robots.txt is evaluated per path, and the path that matters is the one
+    that will be requested. ``allowed_paths`` then records the path the gate
+    evaluated and permitted, so the collector's own path check enforces
+    something meaningful. When ``target_url`` is absent the base URL's path is
+    evaluated, which is the pre-existing behaviour. The gate still records the
+    checked ``base_url`` (as evidence), not the target address: consent is for
+    the source's address, and the target is one request within it.
     """
     source = source or {}
     fetcher = fetcher or _default_fetcher
@@ -226,6 +256,9 @@ def check_compliance(source, *, fetcher=None, config=None):
     allowed_paths = []
     evidence = []
     notes = []
+    # The path robots.txt is asked about: the request that will be made when
+    # the caller says what it is, the base URL's path otherwise.
+    evaluated_path = _robot_path(target_url if target_url else base_url)
 
     record = {
         "source_id": source.get("source_id"),
@@ -248,6 +281,7 @@ def check_compliance(source, *, fetcher=None, config=None):
             "base URL did not answer; the source is marked UNREACHABLE and "
             "does not enter the compliance check"
         )
+        evidence.append(_address_evidence(base_url))
         record["notes"] = "; ".join(notes)
         return record
 
@@ -281,14 +315,15 @@ def check_compliance(source, *, fetcher=None, config=None):
         record["compliance_status"] = STATUS_BLOCKED
         notes.append("robots.txt refuses this request; automatic collection stops")
     elif robots_status == "allowed":
-        path = _robot_path(base_url)
-        if not rules.is_allowed(path):
+        if not rules.is_allowed(evaluated_path):
             record["compliance_status"] = STATUS_BLOCKED
-            notes.append(f"robots.txt disallows {path} for this source")
+            notes.append(
+                f"robots.txt disallows {evaluated_path} for this source"
+            )
         else:
-            allowed_paths.append(path)
+            allowed_paths.append(evaluated_path)
     elif robots_status == "absent":
-        allowed_paths.append(_robot_path(base_url))
+        allowed_paths.append(evaluated_path)
     else:
         # Unrecognised status: fail closed. This branch must never yield
         # ALLOWED, however evaluate_robots evolves.
@@ -323,5 +358,6 @@ def check_compliance(source, *, fetcher=None, config=None):
             f"request interval {effective_rate_limit}s applied to this source's requests"
         )
 
+    evidence.append(_address_evidence(base_url))
     record["notes"] = "; ".join(notes)
     return record
