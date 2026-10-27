@@ -139,6 +139,21 @@ class TestLoadResearch(unittest.TestCase):
             load_research(self.root)
         self.assertIn("research.yaml", str(caught.exception))
 
+    def test_missing_record_raises_file_not_found(self):
+        # "There is no record" is a different answer from "the record is
+        # corrupt": a caller deciding whether to initialise the project must be
+        # able to tell them apart (archive.load_state draws the same line).
+        (self.root / "research.yaml").unlink()
+        with self.assertRaises(FileNotFoundError) as caught:
+            load_research(self.root)
+        self.assertIn("research.yaml", str(caught.exception))
+
+    def test_malformed_record_is_rejected_with_path(self):
+        (self.root / "research.yaml").write_text("status: [", encoding="utf-8")
+        with self.assertRaises(ValueError) as caught:
+            load_research(self.root)
+        self.assertIn("research.yaml", str(caught.exception))
+
     def test_boolean_recent_days_is_not_a_window(self):
         rec = init_research(
             self.tmp, domain="security", topic="bool-topic",

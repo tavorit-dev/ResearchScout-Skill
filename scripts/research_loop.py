@@ -14,10 +14,14 @@ host agent, which owns every semantic judgement:
 
 Four invariants meet here for the first time.
 
-1. **Compliance before collection (invariant 1, V2).** ``run_round`` calls
-   ``collector.collect``, which calls ``assert_compliance_allows`` before it
-   touches the transport. Nothing in this module fetches a source itself, skips
-   that check, or retries past a ``PermissionError``.
+1. **Compliance before collection (invariant 1, V2).** For every verified
+   source the round obtains a compliance decision first: it calls
+   ``compliance_gate.check_compliance`` when the source carries no
+   ``checked_at``, and honours the recorded decision when it does. Only
+   ``ALLOWED`` reaches ``collector.collect``, whose
+   ``assert_compliance_allows`` remains the structural backstop. Nothing in
+   this module collects without a decision, trusts a permission status that no
+   check recorded, or retries past a refusal.
 
 2. **Raw records, analysis and conclusions stay apart (invariant 5).** The
    agent's backfilled findings are untrusted input at a boundary, so
@@ -50,11 +54,11 @@ Two deliberate details found by earlier tasks:
   Whether the project exists at all is still guarded by the archive writers'
   directory checks.
 
-Nothing here opens a socket except through the fetcher the collector is given
-(the real transport when none is injected), and nothing here reads a URL out of
-untrusted content: addresses come from the source records and from the fixed
-set of action fields. Tests inject a fetcher and use only reserved domains
-(V9).
+Nothing here opens a socket except through the fetcher the compliance gate and
+the collector are given (the real transport when none is injected), and nothing
+here reads a URL out of untrusted content: addresses come from the source
+records and from the fixed set of action fields. Tests inject a fetcher and use
+only reserved domains (V9).
 """
 import argparse
 import importlib
@@ -84,6 +88,7 @@ from scripts.archive import (DOCUMENTS_FILE, FINDINGS_FILE, ROUND_DIGITS,
                              save_documents, save_findings, save_iteration,
                              save_state, save_summary)
 from scripts.collector import collect
+from scripts.compliance_gate import STATUS_ALLOWED, check_compliance
 from scripts.content_extractor import extract_content
 from scripts.deduplicator import dedupe
 from scripts.lib.config import DEFAULTS, load_config
@@ -92,7 +97,7 @@ from scripts.lib.ids import new_id
 from scripts.lib.jsonl import read_records, upsert_by_id
 from scripts.lib.urlnorm import normalize_url
 from scripts.lib.validate import validate_record
-from scripts.planner import RECORD_FILE, load_research
+from scripts.planner import load_research
 from scripts.reflection import (FINDING_SCORE_FIELDS, compute_weight,
                                 merge_findings, summarize_state)
 
@@ -183,23 +188,34 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
        without a scope, and silently collecting as if it had been is the wrong
        direction.
     2. Resolve sources: the ``sources`` argument, else
-       ``sources/selected_sources.jsonl``. A supplied list is written to that
-       file with ``upsert_by_id``; this module is its only writer. Sources
-       whose ``discovery_verified`` is not exactly ``True`` go to
+       ``sources/selected_sources.jsonl``. Sources whose
+       ``discovery_verified`` is not exactly ``True`` go to
        ``candidates_for_review`` and are **never** collected (spec 8.3, V5);
        that split is program-enforced, not a note in the handoff.
-    3. Collect each verified source with ``collector.collect``, which runs the
-       compliance block first. A ``PermissionError`` is reported and the round
-       moves on to the next source; it is never retried or bypassed.
-    4. Extract pages (a web source yields no feed entries, so the captured
+    3. Obtain a compliance decision for every verified source (spec 6.1,
+       invariant 1). A source that carries no ``checked_at`` is checked with
+       ``compliance_gate.check_compliance`` and costs one unit of the request
+       budget; a source that already carries ``checked_at`` keeps its recorded
+       decision and is **not** re-checked. That is what lets a decision survive
+       across rounds. ``config``'s ``compliance_recheck_days`` is not consulted
+       yet -- a deferred refinement -- so a recorded decision is permanent for
+       v1. The merged record is written back to ``sources/selected_sources.jsonl``
+       **after** the check, so the file states the decision that was actually
+       made. A source whose decision is not ``ALLOWED`` is recorded in
+       ``actions_rejected`` and never reaches collection.
+    4. Collect each permitted source with ``collector.collect``, whose
+       ``assert_compliance_allows`` stays as the structural backstop. A
+       ``PermissionError`` is reported and the round moves on to the next
+       source; it is never retried or bypassed.
+    5. Extract pages (a web source yields no feed entries, so the captured
        body is passed to ``extract_content``) and deduplicate the round's
        documents. ``dedupe`` returns ``(kept, report)``; only ``kept`` is
        archived, because semantic near-duplicates are a report, not a removal
        (spec 10.1).
-    5. Persist documents and the cross-round request counter, then assemble the
+    6. Persist documents and the cross-round request counter, then assemble the
        handoff.
 
-    The round is single-pass: it returns after step 5 and never schedules the
+    The round is single-pass: it returns after step 6 and never schedules the
     next one. ``decision`` is the host's to make in ``apply_results``.
 
     Collection is skipped when actions were proposed and *none* were admitted:
@@ -268,6 +284,7 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
 
     actions_rejected = [_action_rejection(item) for item in rejected_actions]
     collected = []
+    sources_path = root / SOURCES_FILE
 
     can_collect = (not actions) or bool(accepted_actions)
     if can_collect and not budget_exhausted:
@@ -288,15 +305,59 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
                 budget_exhausted = True
                 break
 
+            # A source is permitted only after a check recorded a decision.
+            # ``ALLOWED`` without ``checked_at`` is a claim the round must not
+            # trust, so it is re-checked like any other unchecked source.
+            if source.get("checked_at"):
+                merged = dict(source)
+            else:
+                # The gate is one unit of request budget (it fetches
+                # robots.txt). Counting it before the check is the conservative
+                # direction: the hard limit can be reached early, never
+                # exceeded.
+                requests_used += 1
+                merged = {
+                    **source,
+                    **check_compliance(
+                        source, fetcher=recorder, config=effective_config
+                    ),
+                }
+
+            if merged.get("compliance_status") == STATUS_ALLOWED:
+                merged["selection_status"] = "selected"
+            else:
+                merged.setdefault("selection_status", "pending")
+
+            # Persist only after the decision exists, so the file carries the
+            # status the gate recorded rather than the caller's claim. This is
+            # what makes the decision survive to the next round.
+            upsert_by_id(sources_path, merged, "source_id")
+
+            if merged.get("compliance_status") != STATUS_ALLOWED:
+                actions_rejected.append({
+                    "kind": "source",
+                    "source_id": source.get("source_id"),
+                    "compliance_status": merged.get("compliance_status"),
+                    "reason": _compliance_rejection_reason(merged),
+                })
+                continue
+
+            # The gate may have spent the round's last permitted request.
+            if requests_used >= policy["max_requests_per_research"]:
+                budget_exhausted = True
+                break
+
             recorder.last = None
-            # A collect call is the unit of request budget. Counting it even
-            # when the compliance block refuses (no transport request happens)
-            # is the conservative direction: the hard limit can be reached
-            # early, never exceeded.
+            # A collect call is also one unit of request budget. Counting it
+            # even when the compliance block refuses (no transport request
+            # happens) is the conservative direction: the hard limit can be
+            # reached early, never exceeded.
             requests_used += 1
             try:
-                documents = collect(source, fetcher=recorder, config=effective_config)
+                documents = collect(merged, fetcher=recorder, config=effective_config)
             except PermissionError as exc:
+                # Structural backstop: reaching here means the decision and
+                # the collector disagree. The round reports it and moves on.
                 actions_rejected.append({
                     "kind": "source",
                     "source_id": source.get("source_id"),
@@ -317,12 +378,17 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
             collected.extend(documents)
 
             if not documents and not budget_exhausted:
-                page = _page_document(source, recorder.last, effective_config)
+                page = _page_document(merged, recorder.last, effective_config)
                 if page is not None:
                     collected.append(page)
 
             if budget_exhausted:
                 break
+
+    # An unverified source is a candidate for review, not a collection target,
+    # but its record is kept so the user can see what was proposed.
+    for source in review_sources:
+        upsert_by_id(sources_path, source, "source_id")
 
     kept, _report = dedupe(collected)
     if kept:
@@ -501,22 +567,15 @@ def _require_project(root):
 
 
 def _load_research(root):
-    """Load the research record, naming a missing file as ``FileNotFoundError``.
+    """Load the research record, letting ``planner`` name the failure.
 
-    ``planner.load_research`` folds a missing file into ``ValueError`` (it
-    catches the whole ``OSError`` family), but "there is no research record"
-    and "the research record is corrupt" are different answers for a caller
-    deciding whether to initialise the project. The existence check names the
-    first one; the planner still owns reading and validating the second. What
-    matters for spec 7.8 is that neither is silently treated as an empty scope.
+    ``planner.load_research`` already distinguishes the two answers this caller
+    needs: a missing ``research.yaml`` raises ``FileNotFoundError`` naming the
+    path, while a malformed or schema-invalid record raises ``ValueError``.
+    Re-checking existence here would only produce a second message for the same
+    condition. Spec 7.8 still holds either way: neither answer is silently read
+    as an empty scope.
     """
-    record_path = Path(root) / RECORD_FILE
-    if not record_path.exists():
-        raise FileNotFoundError(
-            f"research record not found: {record_path}; a round with proposed "
-            f"actions needs a confirmed scope, so initialize the project with "
-            f"planner.init_research first"
-        )
     return load_research(root)
 
 
@@ -571,22 +630,20 @@ def _usable_count(value):
 
 
 def _resolve_sources(root, sources):
-    """Return the round's source records, persisting a supplied list first.
+    """Return the round's source records without writing them.
 
     ``sources=None`` reads ``sources/selected_sources.jsonl``; ``read_records``
     returns ``[]`` when the file is absent, which is an empty selection rather
-    than an error. A supplied list is upserted by ``source_id`` so a host
-    re-running a selection updates the record instead of duplicating it. This
-    module is the file's only writer, as Task 16 requires; the archive layer's
-    interface is not extended for it.
+    than an error. A supplied list is returned as given. Writing it back is
+    deliberately **not** done here: ``run_round`` persists each record only
+    after the compliance gate has decided it, so the file never holds an
+    unchecked claim in place of a decision. This module remains the file's only
+    writer, as Task 16 requires; the archive layer's interface is not extended
+    for it.
     """
     if sources is None:
         return read_records(Path(root) / SOURCES_FILE)
-    records = list(sources)
-    path = Path(root) / SOURCES_FILE
-    for record in records:
-        upsert_by_id(path, record, "source_id")
-    return records
+    return list(sources)
 
 
 def _split_sources(sources):
@@ -606,6 +663,23 @@ def _split_sources(sources):
         else:
             review.append(source)
     return verified, review
+
+
+def _compliance_rejection_reason(source):
+    """Return the handoff reason for a source the gate did not permit.
+
+    It names both the decision and the evidence note, because "BLOCKED" alone
+    does not tell a reviewer whether robots.txt refused the path, the rules
+    could not be read, or a terms page parked the source for a human.
+    """
+    status = source.get("compliance_status")
+    notes = source.get("notes")
+    if isinstance(notes, str) and notes.strip():
+        return f"compliance gate returned {status}: {notes}"
+    return (
+        f"compliance gate returned {status}: the source is not permitted for "
+        f"collection"
+    )
 
 
 class _RecordingFetcher:
