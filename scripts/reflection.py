@@ -73,7 +73,11 @@ Merging rules (the contract ``tests/test_reflection.py`` pins):
   is per incoming record against the working set as it stands, including
   findings added earlier in the same call; two incoming records that share one
   new statement therefore land the still-single finding in ``added`` and
-  ``reinforced``.
+  ``reinforced``. For the same reason, a batch carrying one record with
+  ``supports`` and another with ``contradicts`` for the same existing
+  statement lands the finding in **both** ``reinforced`` and ``conflicting``:
+  each record is classified on its own, and the buckets describe the batch,
+  not a single verdict about the finding.
 
 ``compute_weight`` implements spec 7.4's ``W = 0.35R + 0.25E + 0.20N + 0.20A``
 with the per-dimension weights read from the caller's mapping (``config/
@@ -90,6 +94,7 @@ dividing the weight into the record) belongs to the archive layer, not here.
 """
 import copy
 import math
+from collections.abc import Mapping
 
 # Weight key -> finding field, in the order spec 7.4 writes the formula.
 # Keeping the mapping here, rather than in four copies of arithmetic, is what
@@ -116,6 +121,38 @@ EMPTY_MARKER = "（暂无）"
 SECTION_TITLES = ("关键发现", "证据", "知识缺口", "矛盾", "下一步行动")
 
 
+def _neutralise(value):
+    """Return ``value`` as one Markdown-safe line for the rendered summary.
+
+    Every string that reaches the document -- a statement, a finding or
+    document id, an evidence type, a gap, an action's topic/type/reason -- is
+    written by an LLM that reads untrusted web pages (CLAUDE.md invariant 6),
+    so it is untrusted input. ``summaries/current.md`` is both a user-facing
+    product and layer one of the memory fed back to the model; a forged
+    ``## 下一步行动`` would read as planner output.
+
+    Only characters that carry *document structure* are neutralised; content
+    is never deleted:
+
+    * CR, LF and CRLF collapse to a single space, so no value can start a new
+      line and therefore cannot open a heading, bullet or code fence.
+    * A backtick becomes an apostrophe, so a value rendered inside a code
+      span cannot close it early and turn the rest into markup.
+    * ``#`` is backslash-escaped, so the text ``## 知识缺口`` inside a value
+      is never mistaken for a heading (Markdown renders ``\\#`` as ``#``, so
+      no content is deleted).
+
+    Other meaning-bearing characters (``*``, ``-``, ``>`` and the like) are
+    kept as-is: once a value cannot start a line they cannot forge a section,
+    and escaping them would corrupt the reader's text. Non-strings are
+    rendered with ``str`` so a dirty value still cannot smuggle a newline in.
+    """
+    text = str(value)
+    text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    text = text.replace("`", "'")
+    return text.replace("#", "\\#")
+
+
 def _is_real_number(value):
     """True for int/float values that are not bool and not NaN/infinity.
 
@@ -140,8 +177,9 @@ def _check_weight(key, value):
             "weight %r must be a number, got %r" % (key, type(value).__name__))
     if not math.isfinite(value):
         raise ValueError("weight %r must be finite, got %r" % (key, value))
-    if value < 0:
-        raise ValueError("weight %r must not be negative, got %r" % (key, value))
+    if value < 0 or value > 1:
+        raise ValueError(
+            "weight %r must be between 0 and 1, got %r" % (key, value))
 
 
 def _score(finding, field):
@@ -159,6 +197,9 @@ def _score(finding, field):
             "score %r must be a number, got %r" % (field, type(value).__name__))
     if not math.isfinite(value):
         raise ValueError("score %r must be finite, got %r" % (field, value))
+    if value < 0 or value > 100:
+        raise ValueError(
+            "score %r must be between 0 and 100, got %r" % (field, value))
     return float(value)
 
 
@@ -178,9 +219,13 @@ def compute_weight(finding, weights):
     figure the summary shows disagree with the plan's formula for no gain.
 
     Each dimension's score is missing from a finding until the agent scores
-    it; a missing or ``None`` score counts as 0. A score that is present but
-    a bool, non-numeric, or NaN/inf is a bug in the caller and raises rather
-    than quietly counting as 0.
+    it; a missing or ``None`` score counts as 0. A score that is present is
+    kept inside spec 7.4's 0-100 range and a weight inside 0-1: a value
+    outside its bound is a bug in the caller or its configuration, and raises
+    rather than quietly skewing the ranking (a single 101, or a weight of 5,
+    would otherwise push the result past the documented scale unnoticed).
+    A score that is present but a bool, non-numeric, or NaN/inf also raises
+    rather than quietly counting as 0.
 
     ``confidence`` is never read. Spec 7.4 keeps the ranking weight and the
     confidence in the claim separate, and the schema's description of
@@ -189,11 +234,16 @@ def compute_weight(finding, weights):
     Raises
     ------
     ValueError
-        When ``weights`` is missing any of the four keys (the message names
-        the missing key or keys), when a weight is not a finite non-negative
-        number, or when a score that is present is not a finite number. In
-        every case the message names the offending key or field.
+        When ``weights`` is not a mapping, when it is missing any of the four
+        keys (the message names the missing key or keys), when a weight is
+        not a finite number in [0, 1], or when a score that is present is not
+        a finite number in [0, 100]. In every case the message names the
+        offending key or field.
     """
+    if not isinstance(weights, Mapping):
+        raise ValueError(
+            "weights must be a mapping, got %r" % type(weights).__name__)
+
     missing = [key for key in FINDING_SCORE_FIELDS if key not in weights]
     if missing:
         raise ValueError(
@@ -218,19 +268,33 @@ def _evidence_list(record):
     return value if isinstance(value, list) else []
 
 
+def _usable_text(value):
+    """True for a non-empty string, the only usable identity component."""
+    return isinstance(value, str) and value != ""
+
+
 def _evidence_key(item):
-    """Return the deduplication key for an evidence item.
+    """Return the deduplication key for an evidence item, or ``None``.
 
     The pair (not the document alone) is the key so that one document can both
     support and contradict the same finding -- spec 7.3 gives ``contradicts``
     and ``partially_supports`` exactly so this can be recorded, and spec 7.2
-    lists contradictions among the memory that must survive a merge. ``None``
-    means "not a mapping, so it has no key"; such items are kept as-is rather
-    than silently dropped.
+    lists contradictions among the memory that must survive a merge.
+
+    ``None`` means the item has no usable key: it is not a mapping, or its
+    ``document_id`` or ``evidence_type`` is missing, empty or not a string.
+    Such items are kept without deduplication rather than silently dropped.
+    Requiring *both* halves also keeps the key hashable: a hostile or dirty
+    record whose ``document_id`` is a list cannot raise ``TypeError`` in the
+    middle of a round.
     """
     if not isinstance(item, dict):
         return None
-    return (item.get("document_id"), item.get("evidence_type"))
+    document_id = item.get("document_id")
+    evidence_type = item.get("evidence_type")
+    if not _usable_text(document_id) or not _usable_text(evidence_type):
+        return None
+    return (document_id, evidence_type)
 
 
 def _merge_evidence(existing_items, incoming_items):
@@ -265,8 +329,15 @@ def _merge_into(target, incoming):
     it keeps its identity stable -- the objects in the result buckets stay the
     same objects as in ``findings`` -- without touching the caller's dict.
     """
-    target["evidence"] = _merge_evidence(_evidence_list(target),
-                                         _evidence_list(incoming))
+    if "evidence" in target and not isinstance(target["evidence"], list):
+        # Dirty data: a malformed state file may carry a single dict instead
+        # of a list. Preserve it so schema validation reports the real
+        # problem; replacing it with a merged list would destroy the evidence
+        # and hide the corruption.
+        pass
+    else:
+        target["evidence"] = _merge_evidence(_evidence_list(target),
+                                             _evidence_list(incoming))
 
     for field in CONFIDENCE_FIELDS:
         if field in incoming:
@@ -305,7 +376,7 @@ def merge_findings(current, incoming):
     """Merge newly extracted findings into the current research memory.
 
     Returns ``{"findings": [...], "added": [...], "reinforced": [...],
-    "conflicting": [...]}``.
+    "conflicting": [...], "skipped": [...]}``.
 
     Matching is exact ``statement`` equality only. Revision of a statement's
     wording is not detected here; see the module docstring for why that is a
@@ -341,13 +412,25 @@ def merge_findings(current, incoming):
       carries no ``contradicts`` evidence and ``conflicting`` when it does
       (and then it is not in ``reinforced``). Its evidence merges into the
       finding either way; a contradiction stays in the data instead of being
-      discarded.
+      discarded. Classification is per record: if one batch carries both a
+      supporting record and a contradicting record for the same statement,
+      the finding is in both ``reinforced`` and ``conflicting``. That is not
+      a contradiction -- the buckets describe the batch's records, not one
+      verdict.
 
     Dirty data: a statement repeated in ``current`` merges into the *first*
     matching record and never raises; the later duplicates are returned
-    untouched. Non-mapping entries in ``incoming`` have no statement to match
-    and are skipped rather than crashing the round. Non-mapping entries in
-    ``current`` are copied through unchanged.
+    untouched. Non-mapping entries in ``current`` are copied through
+    unchanged.
+
+    An incoming record whose ``statement`` is missing, not a string, or blank
+    (whitespace only), and any non-mapping entry in ``incoming``, cannot be
+    matched. Such records are **not** appended as findings -- one statement-
+    less finding would make a later validate-everything-then-write step reject
+    the whole round -- and they do **not** disappear silently either: a deep
+    copy of each is returned in ``skipped`` so the caller can report or repair
+    it. ``skipped`` is always present and is an empty list when nothing was
+    skipped.
 
     Neither input is modified, and the result does not alias either one.
     """
@@ -366,27 +449,31 @@ def merge_findings(current, incoming):
     added = []
     reinforced = []
     conflicting = []
+    skipped = []
     added_ids = set()
     reinforced_ids = set()
     conflicting_ids = set()
 
     for record in incoming:
         if not isinstance(record, dict):
+            skipped.append(copy.deepcopy(record))
             continue
 
         statement = record.get("statement")
-        position = (by_statement.get(statement)
-                    if isinstance(statement, str) else None)
+        if not (isinstance(statement, str) and statement.strip()):
+            skipped.append(copy.deepcopy(record))
+            continue
+
+        position = by_statement.get(statement)
         contradicts = _has_contradiction(record)
 
         if position is None:
             merged = copy.deepcopy(record)
             findings.append(merged)
-            if isinstance(statement, str):
-                # ``setdefault`` mirrors "first one wins" for a statement
-                # repeated inside one batch, so a second copy merges into
-                # this record instead of creating a duplicate.
-                by_statement.setdefault(statement, len(findings) - 1)
+            # ``setdefault`` mirrors "first one wins" for a statement
+            # repeated inside one batch, so a second copy merges into this
+            # record instead of creating a duplicate.
+            by_statement.setdefault(statement, len(findings) - 1)
             _append_once(added, added_ids, merged)
             if contradicts:
                 _append_once(conflicting, conflicting_ids, merged)
@@ -403,6 +490,7 @@ def merge_findings(current, incoming):
         "added": added,
         "reinforced": reinforced,
         "conflicting": conflicting,
+        "skipped": skipped,
     }
 
 
@@ -418,14 +506,14 @@ def _format_number(value):
 def _statement_of(finding):
     statement = finding.get("statement")
     if isinstance(statement, str) and statement.strip():
-        return statement
+        return _neutralise(statement)
     return "（无陈述）"
 
 
 def _finding_id_of(finding):
     finding_id = finding.get("finding_id")
     if isinstance(finding_id, str) and finding_id:
-        return finding_id
+        return _neutralise(finding_id)
     return "（无 ID）"
 
 
@@ -502,14 +590,18 @@ def summarize_state(findings, actions, gaps):
             if not isinstance(evidence_type, str) or not evidence_type:
                 evidence_type = "（未知类型）"
             evidence_lines.append(
-                "- `%s` ← `%s`（%s）" % (finding_id, document_id, evidence_type))
+                "- `%s` ← `%s`（%s）" % (finding_id, _neutralise(document_id),
+                                         _neutralise(evidence_type)))
 
     gap_lines = []
     for gap in gaps:
-        if isinstance(gap, str) and gap.strip():
-            gap_lines.append("- %s" % gap)
-        elif gap is not None:
-            gap_lines.append("- %s" % gap)
+        if gap is None:
+            continue
+        if isinstance(gap, str) and not gap.strip():
+            # A blank gap would render a bare "- " line, which reads as a
+            # malformed document. There is no content to show.
+            continue
+        gap_lines.append("- %s" % _neutralise(gap))
 
     contradiction_lines = []
     for item in ordered:
@@ -520,8 +612,12 @@ def summarize_state(findings, actions, gaps):
             if piece.get("evidence_type") != "contradicts":
                 continue
             document_id = piece.get("document_id")
-            if isinstance(document_id, str) and document_id:
-                documents.append("`%s`" % document_id)
+            if not isinstance(document_id, str) or not document_id:
+                # Match the 证据 section's fallback: a contradiction is still
+                # a contradiction even when its document is unknown, so do
+                # not drop it and render （暂无）.
+                document_id = "（未知文档）"
+            documents.append("`%s`" % _neutralise(document_id))
         if documents:
             contradiction_lines.append(
                 "- **%s**（`%s`）：%s 提出相反证据（contradicts）"
@@ -531,19 +627,19 @@ def summarize_state(findings, actions, gaps):
     action_lines = []
     for action in actions:
         if not isinstance(action, dict):
-            action_lines.append("- %s" % action)
+            action_lines.append("- %s" % _neutralise(action))
             continue
         headline = ""
         if action.get("topic"):
-            headline = "**%s**" % action["topic"]
+            headline = "**%s**" % _neutralise(action["topic"])
         if action.get("type"):
             if headline:
-                headline += "（`%s`）" % action["type"]
+                headline += "（`%s`）" % _neutralise(action["type"])
             else:
-                headline = "`%s`" % action["type"]
+                headline = "`%s`" % _neutralise(action["type"])
         pieces = [headline] if headline else []
         if action.get("reason"):
-            pieces.append("%s" % action["reason"])
+            pieces.append("%s" % _neutralise(action["reason"]))
         if pieces:
             action_lines.append("- " + "：".join(pieces))
         else:
