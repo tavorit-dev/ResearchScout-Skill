@@ -96,10 +96,19 @@ state, and validates no record: persistence (schema validation, id generation,
 dividing the weight into the record) belongs to the archive layer, not here.
 """
 import copy
-import math
 from collections.abc import Mapping
 
 from scripts.lib.markdown import neutralise_line
+from scripts.lib.render import (
+    EMPTY_MARKER,
+    action_line,
+    evidence_list,
+    finding_id_of,
+    format_number,
+    is_real_number,
+    sort_findings,
+    statement_of,
+)
 
 # Weight key -> finding field, in the order spec 7.4 writes the formula.
 # Keeping the mapping here, rather than in four copies of arithmetic, is what
@@ -118,25 +127,8 @@ CONFIDENCE_FIELDS = ("confidence", "importance")
 # is present and non-empty.
 PROSE_FIELDS = ("scope", "limitations", "follow_up")
 
-# Rendered in a summary section that has nothing to report. An empty section
-# with no marker is a malformed document; a marker keeps the shape readable.
-EMPTY_MARKER = "（暂无）"
-
 # The five sections ``summarize_state`` always renders, in order.
 SECTION_TITLES = ("关键发现", "证据", "知识缺口", "矛盾", "下一步行动")
-
-
-def _is_real_number(value):
-    """True for an int/float that is neither bool nor NaN/infinity.
-
-    ``bool`` is excluded because ``True`` is an ``int`` in Python but is never
-    a score or a weight; silently reading it as ``1`` would hide a caller
-    bug. NaN and infinity are excluded because they poison every comparison
-    downstream.
-    """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return False
-    return math.isfinite(value)
 
 
 def _check_weight(key, value):
@@ -146,7 +138,7 @@ def _check_weight(key, value):
     zero would produce a ranking that looks normal and is wrong. That is more
     dangerous than a crash, because nobody notices it.
     """
-    if not _is_real_number(value):
+    if not is_real_number(value):
         raise ValueError(
             "weight %r must be a finite number, got %r" % (key, value))
     if value < 0 or value > 1:
@@ -164,7 +156,7 @@ def _score(finding, field):
     value = finding.get(field)
     if value is None:
         return 0.0
-    if not _is_real_number(value):
+    if not is_real_number(value):
         raise ValueError(
             "score %r must be a finite number, got %r" % (field, value))
     if value < 0 or value > 100:
@@ -225,17 +217,6 @@ def compute_weight(finding, weights):
         _check_weight(weight_key, weight)
         total += float(weight) * _score(finding, score_field)
     return total
-
-
-def _evidence_list(record):
-    """Return a record's evidence list, tolerating dirty data.
-
-    A missing or non-list ``evidence`` becomes an empty list: a malformed
-    state file must not abort the round, and there is nothing to merge from a
-    value that is not a list anyway.
-    """
-    value = record.get("evidence")
-    return value if isinstance(value, list) else []
 
 
 def _usable_text(value):
@@ -306,8 +287,8 @@ def _merge_into(target, incoming):
         # and hide the corruption.
         pass
     else:
-        target["evidence"] = _merge_evidence(_evidence_list(target),
-                                             _evidence_list(incoming))
+        target["evidence"] = _merge_evidence(evidence_list(target),
+                                             evidence_list(incoming))
 
     for field in CONFIDENCE_FIELDS:
         if field in incoming:
@@ -331,7 +312,7 @@ def _has_contradiction(record):
     """True when an incoming finding carries any ``contradicts`` evidence."""
     return any(
         isinstance(item, dict) and item.get("evidence_type") == "contradicts"
-        for item in _evidence_list(record)
+        for item in evidence_list(record)
     )
 
 
@@ -481,48 +462,6 @@ def merge_findings(current, incoming):
     }
 
 
-def _format_number(value):
-    """Render a number compactly, or ``None`` when it is not a usable number."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    if not math.isfinite(value):
-        return None
-    return "%g" % value
-
-
-def _statement_of(finding):
-    statement = finding.get("statement")
-    if isinstance(statement, str) and statement.strip():
-        return neutralise_line(statement)
-    return "（无陈述）"
-
-
-def _finding_id_of(finding):
-    finding_id = finding.get("finding_id")
-    if isinstance(finding_id, str) and finding_id:
-        return neutralise_line(finding_id)
-    return "（无 ID）"
-
-
-def _sort_findings(findings):
-    """Order findings by importance descending, then by ``finding_id``.
-
-    The order is deliberately not derived from ``compute_weight``: this
-    function has no weights, and quietly assuming the defaults would make the
-    ordering unexplainable from the call. A missing or non-numeric importance
-    sorts last by being treated as 0.
-    """
-    def key(finding):
-        importance = finding.get("importance")
-        if isinstance(importance, bool) or not isinstance(importance, (int, float)):
-            importance = 0.0
-        elif not math.isfinite(importance):
-            importance = 0.0
-        return (-float(importance), _finding_id_of(finding))
-
-    return sorted((item for item in findings if isinstance(item, dict)), key=key)
-
-
 def summarize_state(findings, actions, gaps):
     """Render ``summaries/current.md`` from the current research state.
 
@@ -548,24 +487,24 @@ def summarize_state(findings, actions, gaps):
     No timestamp is written: time is the archive layer's job, and the function
     must be deterministic so identical state renders byte-identical text.
     """
-    ordered = _sort_findings(findings)
+    ordered = sort_findings(findings)
 
     finding_lines = []
     for item in ordered:
-        meta = ["`%s`" % _finding_id_of(item)]
-        confidence = _format_number(item.get("confidence"))
+        meta = ["`%s`" % finding_id_of(item)]
+        confidence = format_number(item.get("confidence"))
         if confidence is not None:
             meta.append("置信度 %s" % confidence)
-        importance = _format_number(item.get("importance"))
+        importance = format_number(item.get("importance"))
         if importance is not None:
             meta.append("重要性 %s" % importance)
         finding_lines.append(
-            "- **%s**（%s）" % (_statement_of(item), "，".join(meta)))
+            "- **%s**（%s）" % (statement_of(item), "，".join(meta)))
 
     evidence_lines = []
     for item in ordered:
-        finding_id = _finding_id_of(item)
-        for piece in _evidence_list(item):
+        finding_id = finding_id_of(item)
+        for piece in evidence_list(item):
             if isinstance(piece, dict):
                 document_id = piece.get("document_id")
                 evidence_type = piece.get("evidence_type")
@@ -595,7 +534,7 @@ def summarize_state(findings, actions, gaps):
     contradiction_lines = []
     for item in ordered:
         documents = []
-        for piece in _evidence_list(item):
+        for piece in evidence_list(item):
             if not isinstance(piece, dict):
                 continue
             if piece.get("evidence_type") != "contradicts":
@@ -610,29 +549,10 @@ def summarize_state(findings, actions, gaps):
         if documents:
             contradiction_lines.append(
                 "- **%s**（`%s`）：%s 提出相反证据（contradicts）"
-                % (_statement_of(item), _finding_id_of(item),
+                % (statement_of(item), finding_id_of(item),
                    "、".join(documents)))
 
-    action_lines = []
-    for action in actions:
-        if not isinstance(action, dict):
-            action_lines.append("- %s" % neutralise_line(action))
-            continue
-        headline = ""
-        if action.get("topic"):
-            headline = "**%s**" % neutralise_line(action["topic"])
-        if action.get("type"):
-            if headline:
-                headline += "（`%s`）" % neutralise_line(action["type"])
-            else:
-                headline = "`%s`" % neutralise_line(action["type"])
-        pieces = [headline] if headline else []
-        if action.get("reason"):
-            pieces.append("%s" % neutralise_line(action["reason"]))
-        if pieces:
-            action_lines.append("- " + "：".join(pieces))
-        else:
-            action_lines.append("- （该行动未提供 topic/type/reason）")
+    action_lines = [action_line(action) for action in actions]
 
     bodies = {
         "关键发现": finding_lines,
