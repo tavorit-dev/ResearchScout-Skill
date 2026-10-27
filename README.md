@@ -49,8 +49,8 @@ python3 scripts/research_loop.py --check-env
 
 下面用一个最小项目走完一轮研究。**所有地址、标题与文本都是构造示例**：
 `e.org` 是保留域名，不是真实抓取结果，也不保证可达；实际使用时请换成你自己确认
-的来源。完整的精确片段在 `SKILL.md` 的「First run」一节，本节只做摘要；两者冲突
-时以 `SKILL.md` 为准。
+的来源。本节给出完整可执行的步骤；与 `SKILL.md` 的「First run」冲突时以
+`SKILL.md` 为准。
 
 0. 检查环境：
 
@@ -101,15 +101,67 @@ PY
 `provider="llm"` 的候选来自模型知识，全部标记为 `discovery_verified: false`，
 必须由用户确认后才能做真实请求。
 
-3. 确认范围。宿主把 `core` / `related` / `excluded` 写入 `research.yaml`，并把
-   `{"confirmed": true, "lists": {...}}` 写入 `state/scope.json`；精确片段见
-   `SKILL.md` 的「First run」第 3 步。**未确认的范围会让每个行动都被拒绝
-   （`rejected_as: "unconfirmed_scope"`），该轮不会采集。**
+3. 确认范围。下面的片段把 `core` / `related` / `excluded` 写入 `research.yaml`，
+   并把 `{"confirmed": true, "lists": {...}}` 写入 `state/scope.json`。**未确认的
+   范围会让每个行动都被拒绝（`rejected_as: "unconfirmed_scope"`），该轮不会采集。**
 
-4. 确认来源并做可达性检查。用户确认哪些候选可读，把 `source_id` 写入
-   `confirmed-sources.json`，再只对它们调用 `check_reachability`；精确片段见
-   `SKILL.md` 的「First run」第 4 步。未确认的候选不会被探测、验证或采集。可达性
-   只回答地址是否响应，不是许可决定。
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+import yaml
+
+root = Path("archive/industry/example-topic")
+record = yaml.safe_load((root / "research.yaml").read_text(encoding="utf-8"))
+record["scope"] = {
+    "core": ["示例关键词"],
+    "related": ["示例相邻主题"],
+    "excluded": ["示例排除主题"],
+}
+(root / "research.yaml").write_text(
+    yaml.safe_dump(record, allow_unicode=True, sort_keys=False), encoding="utf-8"
+)
+(root / "state" / "scope.json").write_text(
+    json.dumps(
+        {"confirmed": True, "lists": record["scope"]},
+        ensure_ascii=False,
+        indent=2,
+    ) + "\n",
+    encoding="utf-8",
+)
+PY
+```
+
+4. 确认来源并做可达性检查。用户确认哪些候选可读后，把它们的 `source_id` 写入
+   `confirmed-sources.json`。下面的片段只探测这些被确认的候选：未确认的候选不会
+   被探测、验证或采集。可达性只回答地址是否响应，不是许可决定。
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+from scripts.compliance_gate import check_reachability
+
+candidates = json.loads(Path("candidates.json").read_text(encoding="utf-8"))
+confirmed = set(json.loads(
+    Path("confirmed-sources.json").read_text(encoding="utf-8")
+))
+kept, unreachable = [], []
+for candidate in candidates:
+    if candidate.get("source_id") not in confirmed:
+        # An unconfirmed candidate is never probed, verified or collected.
+        continue
+    if check_reachability(candidate) == "REACHABLE":
+        candidate["discovery_verified"] = True
+        kept.append(candidate)
+    else:
+        unreachable.append(candidate.get("source_id"))
+Path("sources.json").write_text(
+    json.dumps(kept, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+)
+print("unreachable confirmed sources:", unreachable)
+PY
+```
 
 5. 运行一轮。合规闸门在轮次内部执行，宿主不能自己把来源标成 `ALLOWED`：
 

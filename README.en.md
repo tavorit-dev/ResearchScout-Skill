@@ -58,8 +58,8 @@ The scripts do not call a model service and do not need an API key.
 The example below runs one minimal research round. **Every address, title and
 piece of text is constructed**: `e.org` is a reserved domain, not a real crawl
 result, and it is not guaranteed to answer. Replace it with sources you have
-confirmed yourself. The exact snippets live in the "First run" section of
-`SKILL.md`; this section is a summary, and `SKILL.md` wins on any conflict.
+confirmed yourself. This section gives complete, runnable steps; `SKILL.md`
+wins on any conflict.
 
 0. Check the environment:
 
@@ -111,18 +111,70 @@ Candidates from `provider="llm"` come from model knowledge and are all marked
 `discovery_verified: false`. They may make a real request only after the user
 confirms them.
 
-3. Confirm the scope. The host writes `core` / `related` / `excluded` to
+3. Confirm the scope. The snippet below writes `core` / `related` / `excluded` to
    `research.yaml` and writes `{"confirmed": true, "lists": {...}}` to
-   `state/scope.json`; the exact snippet is step 3 of "First run" in `SKILL.md`.
-   **An unconfirmed scope refuses every action (`rejected_as:
-   "unconfirmed_scope"`), and that round collects nothing.**
+   `state/scope.json`. **An unconfirmed scope refuses every action
+   (`rejected_as: "unconfirmed_scope"`), and that round collects nothing.**
 
-4. Confirm sources and check reachability. The user confirms which candidates
-   may be read; record their `source_id` values in `confirmed-sources.json`,
-   then call `check_reachability` on those candidates only; the exact snippet is
-   step 4 of "First run" in `SKILL.md`. An unconfirmed candidate is never
-   probed, verified or collected. Reachability only says whether an address
-   answers; it is not a permission decision.
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+import yaml
+
+root = Path("archive/industry/example-topic")
+record = yaml.safe_load((root / "research.yaml").read_text(encoding="utf-8"))
+record["scope"] = {
+    "core": ["example keyword"],
+    "related": ["example adjacent topic"],
+    "excluded": ["example excluded topic"],
+}
+(root / "research.yaml").write_text(
+    yaml.safe_dump(record, allow_unicode=True, sort_keys=False), encoding="utf-8"
+)
+(root / "state" / "scope.json").write_text(
+    json.dumps(
+        {"confirmed": True, "lists": record["scope"]},
+        ensure_ascii=False,
+        indent=2,
+    ) + "\n",
+    encoding="utf-8",
+)
+PY
+```
+
+4. Confirm sources and check reachability. After the user confirms which
+   candidates may be read, write their `source_id` values to
+   `confirmed-sources.json`. The snippet below probes those candidates only: an
+   unconfirmed candidate is never probed, verified or collected. Reachability
+   only says whether an address answers; it is not a permission decision.
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+from scripts.compliance_gate import check_reachability
+
+candidates = json.loads(Path("candidates.json").read_text(encoding="utf-8"))
+confirmed = set(json.loads(
+    Path("confirmed-sources.json").read_text(encoding="utf-8")
+))
+kept, unreachable = [], []
+for candidate in candidates:
+    if candidate.get("source_id") not in confirmed:
+        # An unconfirmed candidate is never probed, verified or collected.
+        continue
+    if check_reachability(candidate) == "REACHABLE":
+        candidate["discovery_verified"] = True
+        kept.append(candidate)
+    else:
+        unreachable.append(candidate.get("source_id"))
+Path("sources.json").write_text(
+    json.dumps(kept, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+)
+print("unreachable confirmed sources:", unreachable)
+PY
+```
 
 5. Run the round. The compliance gate runs inside the round; the host never
    marks a source `ALLOWED` itself:

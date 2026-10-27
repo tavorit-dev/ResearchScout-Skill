@@ -11,8 +11,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   本地命令的 AI 编码工具使用。
 - 不引入独立数据库服务器、多 Agent 编排、知识图谱、向量数据库或常驻 Web 服务。
 - 不实现任何绕过访问限制的能力（更换 User-Agent、代理、验证码绕过）。
-- 当前仓库只有 `docs/` 下的两份 PRD，尚无代码；目录结构与脚本命名以
-  `docs/prd-refactor.md` 第六章为准。
+- v1 代码已在 `scripts/` 落地；实际目录结构与脚本命名以 `README.md` 的
+  「目录结构」一节为准。`docs/prd-refactor.md` 第六章是设计记录，其中
+  `relevance_ranker`、`templates/`、`viewer/` 尚未实现。
 
 `docs/` 下的两份文档是设计记录，不是规范：`prd-init.md` 是最初的「分阶段爬虫」
 方案，`prd-refactor.md` 是对它的修订，改为 ReAct 式研究循环 + 主题约束 + 分类
@@ -71,17 +72,18 @@ LLM 只负责语义相关性判断、结构化摘要、跨文档综合与后续�
 
 ### 目录结构
 
-以 `docs/prd-refactor.md` 第六章为准，摘要如下：
+`docs/prd-refactor.md` 第六章是设计记录；v1 实际结构摘要如下，以 `README.md`
+的「目录结构」一节为准：
 
 | 路径 | 职责 |
 | --- | --- |
 | `SKILL.md` | 入口、工作流、通用强约束、状态选择、文件索引 |
 | `config/` | `default.yaml`、`scoring.yaml`、`iteration.yaml` |
-| `scripts/` | `planner` / `research_loop` / `source_discovery` / `compliance_gate` / `collector` / `content_extractor` / `relevance_ranker` / `reflection` / `archive` / `exporter` / `viewer` |
+| `scripts/` | `action_gate` / `archive` / `collector` / `compliance_gate` / `content_extractor` / `deduplicator` / `exporter` / `planner` / `reflection` / `research_loop` / `source_discovery` / `viewer`（Phase 5 占位）与 `lib/` |
 | `schemas/` | `research` / `source` / `document` / `finding` / `action` 五份 JSON Schema |
-| `archive/registry/` | 跨研究项目共享的 `sources.jsonl` 与 `source_policies.jsonl` |
+| `archive/registry/` | v1 未实现（实际来源登记是每个项目的 `sources/selected_sources.jsonl`） |
 | `archive/<领域>/<主题>/` | 单个研究项目的全部数据（见下） |
-| `templates/` + `viewer/` | 静态 HTML 查看器的模板与样式脚本 |
+| `templates/` + `viewer/` | Phase 5 未实现（静态 HTML 查看器的模板与样式脚本） |
 
 单个研究项目内部：`research.yaml`、`state/`（`current.json`、`scope.json`、
 `pending_actions.json`）、`sources/`、`documents/`、`findings/`、`iterations/`、
