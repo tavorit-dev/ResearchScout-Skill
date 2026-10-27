@@ -58,6 +58,37 @@ def normalize_url(url):
     )
 
 
+def origin_of(url):
+    """Return ``(scheme, host, port)`` for url, or None when unreadable.
+
+    The origin -- not the host -- is the unit an HTTP consent covers. A
+    scheme or port change is a different rules context just as much as a
+    different host is, so both redirect checks and the compliance gate compare
+    this value rather than hostnames. Default ports are normalised, so
+    ``https://e.org`` and ``https://e.org:443`` are one origin.
+    """
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except (TypeError, ValueError):
+        return None
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if not scheme or not host:
+        return None
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return scheme, host, port
+
+
+def same_origin(left, right):
+    """Return True when both URLs name the same scheme, host and port."""
+    left_origin = origin_of(left)
+    return left_origin is not None and left_origin == origin_of(right)
+
+
 def url_identity(url):
     """Return the deduplication key for a URL.
 

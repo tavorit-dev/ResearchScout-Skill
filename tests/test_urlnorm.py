@@ -1,5 +1,5 @@
 import unittest
-from scripts.lib.urlnorm import normalize_url, url_identity
+from scripts.lib.urlnorm import normalize_url, same_origin, url_identity
 from scripts.lib.hashing import content_hash
 
 
@@ -38,6 +38,25 @@ class TestUrlIdentity(unittest.TestCase):
         ]
         identities = {url_identity(u) for u in forms}
         self.assertEqual(len(identities), 1)
+
+
+class TestSameOrigin(unittest.TestCase):
+    def test_default_ports_are_normalised(self):
+        self.assertTrue(same_origin("https://e.org", "https://e.org:443/a"))
+        self.assertTrue(same_origin("http://e.org:80/a", "http://e.org"))
+
+    def test_a_different_scheme_is_a_different_origin(self):
+        self.assertFalse(same_origin("https://e.org/a", "http://e.org/a"))
+
+    def test_a_different_port_is_a_different_origin(self):
+        self.assertFalse(same_origin("https://e.org/a", "https://e.org:8443/a"))
+
+    def test_a_different_host_is_a_different_origin(self):
+        self.assertFalse(same_origin("https://e.org/a", "https://evil.example/a"))
+
+    def test_an_unreadable_url_is_never_the_same_origin(self):
+        self.assertFalse(same_origin("", "https://e.org"))
+        self.assertFalse(same_origin("https://e.org", None))
 
 
 class TestContentHash(unittest.TestCase):

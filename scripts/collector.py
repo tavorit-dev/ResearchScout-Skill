@@ -17,9 +17,10 @@ caller that owns them:
 
 * A redirect is re-checked. ``fetch`` reports where the request ended up in
   ``final_url`` and leaves re-checking to the caller, because only the caller
-  knows what the request was for. When a redirect lands on a different host,
-  the body did not come from the permitted source, so it is refused rather
-  than archived.
+  knows what the request was for. When a redirect lands on a different origin
+  -- another scheme, host or port -- the body did not come from the permitted
+  source, so it is refused rather than archived. A scheme or port change is a
+  different rules context just as much as another host is.
 * The scheme is allowlisted. Discovery accepts any scheme with a host, so an
   ``ftp://`` address can arrive here as a source with ``access_method`` of
   ``web``. Such an address is never handed to ``fetch``.
@@ -68,7 +69,7 @@ from urllib.parse import unquote, urlsplit
 from scripts.lib.hashing import content_hash
 from scripts.lib.http import DEFAULT_DELAY, fetch
 from scripts.lib.ids import new_id
-from scripts.lib.urlnorm import normalize_url
+from scripts.lib.urlnorm import normalize_url, same_origin
 
 # The one compliance status that permits collection (spec 6.2).
 STATUS_ALLOWED = "ALLOWED"
@@ -308,8 +309,16 @@ def _summary_of(entry):
     Only what the feed itself published is taken, and it is kept as data. This
     is the feed's summary, not a summary this tool wrote; the host agent
     produces the compliant summary later.
+
+    ``<content>`` is deliberately not a fallback (spec 9.6). In Atom it often
+    carries the full article body, so reading it here would store the complete
+    text as ``summary`` under reference retention -- exactly the copy the
+    retention mode says is not kept -- and would fingerprint the article body
+    as the content hash. ``description`` (RSS) and ``summary`` (Atom) are the
+    feed's short metadata fields; an entry that has only ``content`` gets an
+    empty summary and a fingerprint from its title.
     """
-    return _child_text(entry, ("description", "summary", "content"))
+    return _child_text(entry, ("description", "summary"))
 
 
 def _entry_title(entry):
@@ -713,12 +722,11 @@ def collect(source, *, fetcher=None, config=None):
     # as "no redirect happened" -- the request ended where it was sent.
     final_url = result.get("final_url") or address
     # The redirect is re-checked rather than trusted. A fetch that ended on a
-    # different host -- or on a scheme this collector does not speak, or on an
-    # address whose host cannot be read at all -- did not come from the source
-    # the gate permitted, so it is refused instead of archived. Two unreadable
-    # hosts must not compare equal, which is why the target's own host has to
-    # be non-empty before the comparison is made.
-    if not requested_host or _host_of(final_url) != requested_host:
+    # different origin -- another scheme, host or port -- did not come from the
+    # source the gate permitted, so it is refused instead of archived. The
+    # comparison is origin-based because a scheme or port change is a different
+    # rules context, not merely another address on the same host.
+    if not same_origin(address, final_url):
         return []
     if not _scheme_allowed(final_url):
         return []

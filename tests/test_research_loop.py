@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -13,6 +14,7 @@ from scripts.archive import (load_state, rebuild_manifest, save_documents,
                              save_findings, save_state)
 from scripts.lib.jsonl import read_records
 from scripts.lib.paths import ensure_research_layout
+from scripts.lib.policy import save_policy
 from scripts.lib.validate import validate_record
 from scripts.planner import init_research
 from scripts.research_loop import apply_results, check_env, main, run_round
@@ -95,7 +97,9 @@ def source(**overrides):
         "access_method": "rss",
         "feed_url": "https://e.org/feed",
         "compliance_status": "ALLOWED",
-        "checked_at": "2026-10-01T00:00:00+00:00",
+        # A fresh decision is reused without a gate call. The value is
+        # relative to now so the suite does not expire with the calendar.
+        "checked_at": datetime.now(timezone.utc).isoformat(),
         # ``domain`` is what the gate writes, and it is what binds a recorded
         # decision to the host it was made for. A fixture that omits it would
         # model a decision that never was one.
@@ -473,8 +477,8 @@ class TestComplianceGateInRound(TempCase):
         # A decision that carries checked_at survives across rounds: it is
         # neither re-checked nor overridden.
         root = layout_root(self.tmp)
-        recorded = source(compliance_status="BLOCKED",
-                          checked_at="2026-10-01T00:00:00+00:00")
+        checked_at = datetime.now(timezone.utc).isoformat()
+        recorded = source(compliance_status="BLOCKED", checked_at=checked_at)
         fetcher = site_fetcher()
 
         handoff = run_round(root, round_no=1, actions=[],
@@ -486,7 +490,7 @@ class TestComplianceGateInRound(TempCase):
 
         stored = read_records(root / "sources" / "selected_sources.jsonl")
         self.assertEqual(stored[0]["compliance_status"], "BLOCKED")
-        self.assertEqual(stored[0]["checked_at"], "2026-10-01T00:00:00+00:00")
+        self.assertEqual(stored[0]["checked_at"], checked_at)
 
         rejected = [item for item in handoff["actions_rejected"]
                     if item.get("kind") == "source"]
@@ -1940,6 +1944,25 @@ class TestCli(TempCase):
         self.assertIn("LLM", out)
         self.assertEqual(list(self.tmp.iterdir()), [])
 
+    def test_no_host_check_env_exits_non_zero_and_writes_nothing(self):
+        # V11: with no LLM host the readiness check must refuse rather than
+        # produce half-analysed data. The flag is how the caller says so.
+        old = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            code, out, _ = self.run_main(["--check-env", "--no-host"])
+        finally:
+            os.chdir(old)
+        self.assertEqual(code, 1)
+        self.assertIn("LLM", out)
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+    def test_no_host_requires_check_env(self):
+        with self.assertRaises(SystemExit) as caught:
+            with redirect_stderr(io.StringIO()):
+                main(["--no-host"])
+        self.assertNotEqual(caught.exception.code, 0)
+
     def test_round_prints_a_json_handoff(self):
         root = layout_root(self.tmp)
         actions_path = self.tmp / "actions.json"
@@ -2075,6 +2098,279 @@ class TestCli(TempCase):
         self.assertIn("error", err)
         self.assertEqual(out, "")
         self.assertFalse((root / "iterations" / "round-001.json").exists())
+
+
+# -- final-review fix wave: action records, durable state, expiry, policy -----
+
+
+SIMILAR_FEED = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+  <item>
+    <title>Similar One</title>
+    <link>https://e.org/s1</link>
+    <description>agent sandbox isolation mechanism design for untrusted workloads</description>
+  </item>
+  <item>
+    <title>Similar Two</title>
+    <link>https://e.org/s2</link>
+    <description>agent sandbox isolation mechanism design for untrusted work</description>
+  </item>
+</channel></rss>"""
+
+POLICY_NOW = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
+
+
+def policy_record(**overrides):
+    record = {
+        "source_id": "src_feed",
+        "resolved_status": "ALLOWED",
+        "resolved_by": "user",
+        "resolved_at": "2026-10-01T00:00:00+00:00",
+        "reason": "The user reviewed the terms.",
+        "scope": {
+            "paths": ["/"],
+            "access_method": "rss",
+            "expires_at": "2026-11-01T00:00:00+00:00",
+        },
+        "check_record_ref": "src_feed",
+    }
+    record.update(overrides)
+    return record
+
+
+class TestActionSchemaValidation(TempCase):
+    """Every proposed action crosses the schema boundary before the gate (V12)."""
+
+    def test_an_invalid_action_is_reported_not_crashed_on(self):
+        root = project(self.tmp, scope=CONFIRMED_SCOPE)
+        bad = action()
+        bad.pop("time_window_days")
+
+        handoff = run_round(
+            root, round_no=1, actions=[bad], config={"iteration_policy": {}},
+            fetcher=missing_fetcher(), sources=[],
+        )
+
+        self.assertEqual(len(handoff["actions_rejected"]), 1)
+        rejection = handoff["actions_rejected"][0]
+        self.assertEqual(rejection["rejected_as"], "invalid_action")
+        self.assertIn("time_window_days", rejection["reason"])
+        pending = json.loads(
+            (root / "state" / "pending_actions.json").read_text("utf-8")
+        )
+        self.assertEqual(pending["accepted"], [])
+        self.assertEqual(len(pending["rejected"]), 1)
+
+    def test_a_valid_action_still_runs_beside_an_invalid_one(self):
+        root = project(self.tmp, scope=CONFIRMED_SCOPE)
+        bad = {"action_id": "act_bad", "type": "deepen",
+               "topic": "Agent Security", "reason": "x", "priority": 90}
+
+        handoff = run_round(
+            root, round_no=1, actions=[bad, action()],
+            config={"iteration_policy": {}}, fetcher=missing_fetcher(),
+            sources=[],
+        )
+
+        self.assertEqual(
+            [item["action_id"] for item in handoff["actions_rejected"]],
+            ["act_bad"],
+        )
+        self.assertEqual(
+            [item["action_id"] for item in handoff["actions_accepted"]],
+            ["act_1"],
+        )
+
+
+class TestNextActionValidation(TempCase):
+    def test_invalid_next_actions_are_rejected_and_skipped(self):
+        root = layout_root(self.tmp)
+        bad = {"action_id": "act_bad", "type": "deepen"}
+
+        result = apply(root, findings=[], next_actions=[action(), bad])
+
+        iteration = json.loads(
+            (root / "iterations" / "round-001.json").read_text("utf-8")
+        )
+        self.assertEqual(
+            [item["action_id"] for item in iteration["next_actions"]],
+            ["act_1"],
+        )
+        self.assertEqual(len(iteration["rejected_next_actions"]), 1)
+        self.assertIn("topic",
+                      iteration["rejected_next_actions"][0]["error"])
+        self.assertEqual(len(result["rejected_next_actions"]), 1)
+
+
+class TestIterationDurability(TempCase):
+    """Rejected candidate topics survive the round in the iteration file."""
+
+    def test_an_excluded_topic_is_recorded_durably(self):
+        root = project(self.tmp, scope=CONFIRMED_SCOPE)
+        handoff = run_round(
+            root, round_no=1,
+            actions=[action(action_id="act_excluded", topic="GPU 性能优化")],
+            config={"iteration_policy": {}}, fetcher=missing_fetcher(),
+            sources=[],
+        )
+        apply(root, findings=[], handoff=handoff)
+
+        iteration = json.loads(
+            (root / "iterations" / "round-001.json").read_text("utf-8")
+        )
+        self.assertEqual(iteration["actions_accepted"], [])
+        self.assertEqual(len(iteration["actions_rejected"]), 1)
+        rejection = iteration["actions_rejected"][0]
+        self.assertEqual(rejection["topic"], "GPU 性能优化")
+        self.assertEqual(rejection["scope_list"], "excluded")
+
+    def test_an_accepted_action_is_recorded(self):
+        root = project(self.tmp, scope=CONFIRMED_SCOPE)
+        handoff = run_round(
+            root, round_no=1, actions=[action()],
+            config={"iteration_policy": {}}, fetcher=missing_fetcher(),
+            sources=[],
+        )
+        apply(root, findings=[], handoff=handoff)
+
+        iteration = json.loads(
+            (root / "iterations" / "round-001.json").read_text("utf-8")
+        )
+        self.assertEqual(iteration["actions_accepted"], [action()])
+
+    def test_a_topic_accepted_in_a_prior_round_is_a_duplicate(self):
+        root = project(self.tmp, scope=CONFIRMED_SCOPE)
+        first = run_round(
+            root, round_no=1, actions=[action()],
+            config={"iteration_policy": {}}, fetcher=missing_fetcher(),
+            sources=[],
+        )
+        apply(root, findings=[], handoff=first)
+
+        second = run_round(
+            root, round_no=2, actions=[action(action_id="act_again")],
+            config={"iteration_policy": {}}, fetcher=missing_fetcher(),
+            sources=[],
+        )
+
+        self.assertEqual(len(second["actions_rejected"]), 1)
+        self.assertEqual(second["actions_rejected"][0]["rejected_as"],
+                         "duplicate")
+        self.assertEqual(second["actions_accepted"], [])
+
+
+class TestDecisionExpiry(TempCase):
+    """A compliance decision is reused only while it is recent (spec 6.6)."""
+
+    def _run(self, checked_at):
+        root = layout_root(self.tmp)
+        fetcher = text_fetcher(FEED_ONE)
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=fetcher, sources=[source(checked_at=checked_at)],
+        )
+        return fetcher, handoff
+
+    def test_a_stale_decision_is_rechecked(self):
+        fetcher, _ = self._run("2020-01-01T00:00:00+00:00")
+        self.assertIn("https://e.org/robots.txt", fetcher.calls)
+
+    def test_a_malformed_timestamp_is_treated_as_stale(self):
+        fetcher, _ = self._run("not-a-timestamp")
+        self.assertIn("https://e.org/robots.txt", fetcher.calls)
+
+    def test_a_fresh_decision_is_reused(self):
+        fresh = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        fetcher, handoff = self._run(fresh)
+        self.assertEqual(fetcher.calls, ["https://e.org/feed"])
+        self.assertEqual(len(handoff["new_documents"]), 1)
+
+
+class TestPolicyRoundIntegration(TempCase):
+    """V13 through the product path: REVIEW_REQUIRED -> policy -> ALLOWED."""
+
+    def _terms_source(self):
+        record = source(source_id="src_feed", terms_url="https://e.org/terms")
+        record.pop("checked_at")
+        return record
+
+    def _routes(self):
+        return {
+            "https://e.org": {"outcome": "ok", "status": 200, "text": FEED_ONE},
+            "https://e.org/robots.txt": {
+                "outcome": "ok", "status": 200, "text": ROBOTS_ALLOW},
+            "https://e.org/feed": {
+                "outcome": "ok", "status": 200, "text": FEED_ONE},
+        }
+
+    def test_a_user_policy_releases_review_required_and_collects(self):
+        root = layout_root(self.tmp)
+        first = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=routed_fetcher(self._routes()),
+            sources=[self._terms_source()], now=POLICY_NOW,
+        )
+        self.assertEqual(first["new_documents"], [])
+        self.assertEqual(selected_records(root)[0]["compliance_status"],
+                         "REVIEW_REQUIRED")
+
+        save_policy(self.tmp, policy_record())
+
+        second = run_round(
+            root, round_no=2, actions=[], config={"iteration_policy": {}},
+            fetcher=routed_fetcher(self._routes()), now=POLICY_NOW,
+        )
+        self.assertEqual(len(second["new_documents"]), 1)
+        stored = selected_records(root)[0]
+        self.assertEqual(stored["compliance_status"], "ALLOWED")
+        self.assertTrue(any(item["type"] == "source_policy"
+                            for item in stored["evidence"]))
+
+    def test_a_malformed_policy_registry_does_not_crash_the_round(self):
+        root = layout_root(self.tmp)
+        registry = self.tmp / "registry" / "source_policies.jsonl"
+        registry.parent.mkdir(parents=True)
+        registry.write_text("{not json}\n", encoding="utf-8")
+
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=routed_fetcher(self._routes()),
+            sources=[self._terms_source()], now=POLICY_NOW,
+        )
+
+        self.assertEqual(handoff["new_documents"], [])
+        self.assertTrue(any(item.get("kind") == "policy"
+                            for item in handoff["actions_rejected"]))
+        self.assertEqual(selected_records(root)[0]["compliance_status"],
+                         "REVIEW_REQUIRED")
+
+
+class TestSemanticCandidatesInTheRound(TempCase):
+    """Layer 3 becomes reachable through the transient text map (I6)."""
+
+    def test_similar_documents_are_reported_and_both_survive(self):
+        root = layout_root(self.tmp)
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=text_fetcher(SIMILAR_FEED), sources=[source()],
+        )
+
+        self.assertEqual(len(handoff["new_documents"]), 2)
+        pairs = handoff["semantic_candidates"]
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(
+            set(pairs[0]),
+            {document["document_id"] for document in handoff["new_documents"]},
+        )
+        self.assertEqual(
+            len(read_records(root / "documents" / "documents.jsonl")), 2,
+        )
+
+        apply(root, findings=[], handoff=handoff)
+        iteration = json.loads(
+            (root / "iterations" / "round-001.json").read_text("utf-8")
+        )
+        self.assertEqual(len(iteration["semantic_candidates"]), 1)
 
 
 if __name__ == "__main__":

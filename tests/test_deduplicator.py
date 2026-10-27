@@ -60,6 +60,32 @@ class TestDedupe(unittest.TestCase):
         self.assertEqual(report["semantic_candidates"], [("doc_1", "doc_2")])
         self.assertEqual(len(kept), 2)
 
+    def test_transient_texts_make_the_semantic_layer_reachable(self):
+        # Persisted records carry no body, so layer 3 only fires when the
+        # caller supplies this round's transient text map. The pair is reported
+        # and both documents survive; the map is never written to a record.
+        docs = [
+            {"document_id": "doc_1", "canonical_url": "https://a.org/x"},
+            {"document_id": "doc_2", "canonical_url": "https://b.org/y"},
+        ]
+        texts = {
+            "doc_1": "agent sandbox isolation mechanism design for untrusted workloads",
+            "doc_2": "agent sandbox isolation mechanism design for untrusted work",
+        }
+        kept, report = dedupe(docs, texts=texts)
+        self.assertEqual(report["semantic_candidates"], [("doc_1", "doc_2")])
+        self.assertEqual(len(kept), 2)
+        self.assertNotIn("text", kept[0])
+        self.assertNotIn("text", kept[1])
+
+    def test_without_texts_layer_three_stays_quiet(self):
+        docs = [
+            {"document_id": "doc_1", "canonical_url": "https://a.org/x"},
+            {"document_id": "doc_2", "canonical_url": "https://b.org/y"},
+        ]
+        _kept, report = dedupe(docs)
+        self.assertEqual(report["semantic_candidates"], [])
+
     def test_non_mapping_element_is_kept_not_fatal(self):
         docs = [
             doc("doc_1", "https://a.org/x", "first body"),
