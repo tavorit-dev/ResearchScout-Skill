@@ -117,6 +117,19 @@ def check_scope(action, scope):
     only ever speaks of a topic being in a list. An unmatched near-miss is
     refused as out of scope and can be recorded as a candidate topic, which is
     the conservative direction: the gate never widens a scope on its own.
+
+    Raises
+    ------
+    AttributeError
+        When ``scope`` is not a mapping (``None``, a list, a string, a number).
+        ``scope`` is a required argument, so a non-mapping is the caller's
+        integration bug, and it is reported as one rather than folded into the
+        unconfirmed-scope path. Never read this exception as "unconfirmed
+        scope": an unconfirmed scope is a *mapping without* ``confirmed=True``
+        and is refused normally, with a reason. Coercing a non-mapping (for
+        example ``(scope or {}).get(...)``) would disguise a broken call as an
+        ordinary business rejection and blame the user for not confirming a
+        scope that was never passed.
     """
     if scope.get("confirmed") is not True:
         return False, (
@@ -179,9 +192,33 @@ def evaluate_action(action, *, scope, budget, seen_topics, min_priority=None):
       yet, not a proposal of an unlimited search. A present-but-unusable value
       (``None``, ``0``, negative, a bool) is refused, because ``0`` means "no
       window", not "a window of zero days".
+
+    Raises
+    ------
+    AttributeError
+        When ``scope`` or ``action`` is not a mapping (``None``, a list, a
+        string, a number). Both are required arguments, so a non-mapping is the
+        caller's integration bug and is reported as one. This must never be
+        read as "unconfirmed scope": an unconfirmed scope is a *mapping
+        without* ``confirmed=True`` and is refused normally, with
+        ``rejected_as == REJECT_UNCONFIRMED_SCOPE``. A non-mapping ``action``
+        with an unconfirmed ``scope`` still refuses on the scope first, because
+        the scope guard runs before the action is read at all -- so the
+        exception is only ever raised once the scope has been accepted.
     """
     accepted, reason = check_scope(action, scope)
     if not accepted:
+        # Deliberate recheck of the confirmation flag, not redundant
+        # bookkeeping: ``check_scope`` returns only a reason, so the label has
+        # to be derived here from the same condition. The two reads can
+        # disagree only if ``scope`` answers differently the second time -- a
+        # mapping whose ``get`` is not a pure lookup -- and only in the refusal
+        # direction: this read decides the label *after* a refusal has already
+        # been returned, so it can relabel a rejection but can never turn one
+        # into an admission. Deleting the recheck would not open the gate
+        # either, but it would silently downgrade every scope rejection to
+        # ``candidate_topic``, including the unconfirmed-scope refusal that
+        # spec 7.8 and V6 exist to make visible.
         rejected_as = (
             REJECT_UNCONFIRMED_SCOPE
             if scope.get("confirmed") is not True

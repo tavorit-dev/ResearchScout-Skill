@@ -442,5 +442,63 @@ class TestEmptyScopeLists(unittest.TestCase):
                                          seen_topics=[])["accepted"])
 
 
+class TestNonMappingArguments(unittest.TestCase):
+    """A non-mapping argument is a caller bug, and it is raised as one.
+
+    ``scope`` and ``action`` are required arguments, so a caller that passes
+    ``None`` (or a list, or a string) has an integration error, not a research
+    situation. Reporting it as ``unconfirmed_scope`` would disguise the bug as
+    a normal rejection and blame the user for not confirming a scope that was
+    never passed. These tests pin the documented Raises contract; they pin
+    existing behaviour rather than driving new behaviour.
+    """
+
+    def test_check_scope_raises_on_non_mapping_scope(self):
+        for bad in (None, [], "core", 0):
+            with self.subTest(scope=bad):
+                with self.assertRaises(AttributeError):
+                    check_scope(action(), bad)
+
+    def test_evaluate_action_raises_on_non_mapping_scope(self):
+        for bad in (None, [], "core", 0):
+            with self.subTest(scope=bad):
+                with self.assertRaises(AttributeError):
+                    evaluate_action(action(), scope=bad,
+                                    budget={"remaining_documents": 100},
+                                    seen_topics=[])
+
+    def test_check_scope_raises_on_non_mapping_action(self):
+        for bad in (None, [], "deepen", 0):
+            with self.subTest(action=bad):
+                with self.assertRaises(AttributeError):
+                    check_scope(bad, SCOPE)
+
+    def test_evaluate_action_raises_on_non_mapping_action(self):
+        for bad in (None, [], "deepen", 0):
+            with self.subTest(action=bad):
+                with self.assertRaises(AttributeError):
+                    evaluate_action(bad, scope=SCOPE,
+                                    budget={"remaining_documents": 100},
+                                    seen_topics=[])
+
+    def test_non_mapping_scope_is_never_reported_as_unconfirmed(self):
+        # The distinction the contract turns on: a mapping without
+        # ``confirmed=True`` is a business rejection with a reason; a
+        # non-mapping is a raised AttributeError. Collapsing the second into
+        # the first would hide the integration error.
+        self.assertFalse(check_scope(action(), unconfirmed())[0])
+        with self.assertRaises(AttributeError):
+            check_scope(action(), None)
+
+    def test_unconfirmed_scope_refuses_before_a_non_mapping_action_is_read(self):
+        # The scope guard runs first, so an unconfirmed scope reports its own
+        # rejection even when the action is also unusable.
+        result = evaluate_action(None, scope=unconfirmed(),
+                                 budget={"remaining_documents": 100},
+                                 seen_topics=[])
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["rejected_as"], "unconfirmed_scope")
+
+
 if __name__ == "__main__":
     unittest.main()
