@@ -23,7 +23,9 @@ Research Scout（研究侦察员）是一个面向行业研究的迭代式信息
   `PyYAML` 用于读取 `config/*.yaml`。
 - 所有命令都在 Skill 根目录执行。
 - 安装依赖后，用 `python3 scripts/research_loop.py --check-env` 确认就绪。它只
-  打印 Python 版本与依赖状态，不写任何文件。
+  打印 Python 版本与依赖状态，不写任何文件。没有 LLM 宿主时用
+  `python3 scripts/research_loop.py --check-env --no-host`：报告会说明本 Skill
+  无法独立运行并以非零状态退出，同样不写任何文件。
 
 ## 安装
 
@@ -151,22 +153,33 @@ candidates = json.loads(Path("candidates.json").read_text(encoding="utf-8"))
 confirmed = set(json.loads(
     Path("confirmed-sources.json").read_text(encoding="utf-8")
 ))
-kept, unreachable = [], []
+kept, unreachable, blocked = [], [], []
 for candidate in candidates:
     if candidate.get("source_id") not in confirmed:
         # An unconfirmed candidate is never probed, verified or collected.
         continue
-    if check_reachability(candidate) == "REACHABLE":
+    answer = check_reachability(candidate)
+    if answer == "REACHABLE":
         candidate["discovery_verified"] = True
         kept.append(candidate)
+    elif answer == "BLOCKED":
+        # 401/403 或其他 4xx：服务器拒绝了请求。
+        blocked.append(candidate.get("source_id"))
     else:
+        # 超时、网络故障或 5xx：地址没有响应。
         unreachable.append(candidate.get("source_id"))
 Path("sources.json").write_text(
     json.dumps(kept, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
 )
+print("blocked confirmed sources:", blocked)
 print("unreachable confirmed sources:", unreachable)
 PY
 ```
+
+可达性只回答地址是否响应，不是许可决定：拒绝（401/403/4xx）是 `BLOCKED`，
+超时或 5xx 是 `UNREACHABLE`，两者都不是允许。轮次内的合规闸门仍会重新决定
+`sources.json` 中的每个 `REVIEW_REQUIRED` 来源能否被采集；用户显式授权后可按
+「合规声明」中的片段写入带范围与有效期的授权记录。
 
 5. 运行一轮。合规闸门在轮次内部执行，宿主不能自己把来源标成 `ALLOWED`：
 
@@ -228,8 +241,9 @@ PY
   也不是许可。
 - **轮次 handoff**：`new_documents`（仅元数据）、`document_texts`（本轮新文档的
   正文或摘要，仅供本轮分析，不持久化）、`document_warnings`（正文中命中的提示注入
-  短语，仅提示）、`state_summary`、`remaining_budget`、`actions_rejected` 与
-  `budget_exhausted`。
+  短语，仅提示）、`state_summary`、`remaining_budget`、`actions_rejected`、
+  `actions_accepted`、`semantic_candidates` 与 `budget_exhausted`。语义近似对只
+  报告，不删除文档。
 - **归档内容**：只有元数据与内容指纹（`retention_mode: "reference"`），不保存
   完整原文。
 - **提示注入警告只是提示**：命中说明正文含常见于诱导 Agent 的短语，不等于攻击
@@ -242,8 +256,16 @@ PY
 - 本项目的合规状态是产品状态，不是法律许可认定。`ALLOWED` 只表示本工具执行的
   检查没有发现禁止采集的规则，不构成授权、许可或法律意见。
 - 状态必须区分：`ALLOWED`、`BLOCKED`、`REVIEW_REQUIRED`、`ERROR`、
-  `UNREACHABLE`、`DISCOVERED`、`CHECKING`。`ERROR`（例如 robots.txt 读不到）与
-  `UNREACHABLE` 都表示来源被暂停，绝不等于允许。
+  `UNREACHABLE`、`DISCOVERED`、`CHECKING`。`BLOCKED` 表示明确规则禁止采集，或
+  来源拒绝可达性请求（401/403 或其他 4xx）；`ERROR`（例如 robots.txt 读不到）与
+  `UNREACHABLE`（超时、网络故障或 5xx）都表示来源被暂停，绝不等于允许。
+- robots.txt 以本客户端的产品标识 `ResearchScout` 评估（传输 User-Agent 为
+  `ResearchScout/0.1`），而不是只读 `*` 组：站点为 `ResearchScout` 写的禁止规则
+  同样生效。
+- `REVIEW_REQUIRED` 不会自行变成 `ALLOWED`，只能由用户显式授权解除：授权写入
+  `archive/registry/source_policies.jsonl`，带授权范围（路径与访问方式）和
+  `expires_at`。`BLOCKED`、`ERROR`、`UNREACHABLE` 不能被授权覆盖；授权是产品
+  动作，不是法律许可。
 - 合规检查是强制独立模块：任何来源、任何轮次、任何扩展层级都必须先过
   `scripts/compliance_gate.py`；`collector.assert_compliance_allows` 是结构性
   兜底，只有 `ALLOWED` 能通过。
@@ -311,6 +333,7 @@ PY
 │       ├── jsonl.py
 │       ├── markdown.py
 │       ├── paths.py
+│       ├── policy.py
 │       ├── render.py
 │       ├── robots.py
 │       ├── sanitize.py
@@ -332,7 +355,9 @@ PY
 ## v1 范围与未实现项
 
 已实现：合规采集与来源登记、分类归档、研究循环（行动准入、预算、去重、发现合并、
-研究记忆）、Markdown 与 CSV 导出、断点恢复与增量采集、不可信内容隔离。
+研究记忆）、Markdown 与 CSV 导出、不可信内容隔离，以及 `REVIEW_REQUIRED` 的用户
+授权登记（`archive/registry/source_policies.jsonl`，带范围与有效期）。断点恢复
+限于状态与归档文件：`state/` 与归档可恢复，但 v1 不提供自动跨轮续跑。
 
 未实现或不在 v1 范围：
 
@@ -340,11 +365,23 @@ PY
   `templates/` 或 `viewer/` 目录。
 - 第三方搜索 provider：只有接口。
 - 向量数据库、语义检索、嵌入、知识图谱、多 Agent 编排、常驻 Web 服务。
-- 语义近似去重只报告疑似对，不自动合并。
+- 语义近似去重只报告疑似对，不自动合并；它借助本轮 `document_texts` 的临时文本
+  参与比较，文本本身不持久化。
+- 文档状态机只实现一部分：状态只推进到流水线实际设置的 `FETCHED` / `EXTRACTED` /
+  `PERSISTED`；成功文档的 `attempt_count` 恒为 0；永久失败重试与“下一轮优先处理”
+  未实现，报告中的「永久失败文档」小节在 v1 中始终为空。
+- 自动重试未实现：5xx 或 429 视为该轮的取回失败；robots 检查失败为 `ERROR` 且
+  永不重试。这是对 spec 10.4「有限重试」的有意偏离。
+- API / Feed 条款与额度维度未实现：未声明 terms URL 的 rss / api 来源只按
+  robots.txt 评估。
 - `config/scoring.yaml` 的 `document_weights` 已定义，但 v1 没有脚本消费它；发现
   权重 `finding_weights` 由 `scripts/reflection.py` 使用。
+- 惰性配置项：`max_attempts`，以及 `config/iteration.yaml` 中的
+  `max_branch_depth`、`max_active_branches`、`min_new_information_ratio`、
+  `stop_when_no_progress_rounds` 已定义，但 v1 没有脚本读取或执行。
 - 文档级相关性/时效性等评分没有自动计算模块；相关 Schema 字段存在，但 v1 不填。
-- `compliance_recheck_days` 已定义，v1 尚未使用：同一地址的已记录决定会持续复用。
+- `compliance_recheck_days` 已使用：记录的合规决定超过该期限（默认 30 天）后会
+  重新检查；时间戳缺失或无法解析同样会触发重查。
 - 浏览器渲染与 JavaScript 页面不处理；采集只读取 HTTP 响应中的静态内容。
 
 ## 测试

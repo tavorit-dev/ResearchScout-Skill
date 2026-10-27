@@ -203,7 +203,8 @@ python3 scripts/research_loop.py --root archive/<领域>/<主题> --apply result
 片段见 `SKILL.md` 的 Prerequisites 与 First run 两节。`scripts/viewer.py` 是
 Phase 5 占位，调用时抛出 `NotImplementedError`。
 
-Python 标准库优先；引入第三方依赖需在 `requirements.txt` 中声明并说明理由。
+Python 标准库优先；引入第三方依赖需在 `requirements.txt` 中声明，依赖理由写在
+`README.md` 的安装一节。
 合规检查、去重、URL 规范化等确定性逻辑的测试不得联网，使用 fixture。
 
 ## 不要做

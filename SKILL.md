@@ -24,7 +24,10 @@ and the proposal of the next direction.
 - Run every command from the Skill root. The examples below assume that.
 - Check readiness with `python3 scripts/research_loop.py --check-env`. After the
   dependencies are installed it reports the Python version and host readiness,
-  and writes no files.
+  and writes no files. In a hostless environment run
+  `python3 scripts/research_loop.py --check-env --no-host`: the report states
+  that the Skill cannot run on its own and exits non-zero, still writing
+  nothing (V11).
 
 `scripts/research_loop.py` is the only module with a command line. The planner,
 source discovery, compliance gate and exporter are Python functions; this
@@ -87,6 +90,12 @@ An action has these required fields, from `schemas/action.schema.json`:
 - The scripts enforce the constraints the host must not decide alone: the
   confirmed scope, the remaining document budget, the priority floor and the
   time window.
+- Every proposed action is validated against `schemas/action.schema.json`
+  before the admission gate sees it. An invalid record is reported as
+  `rejected_as: "invalid_action"` and the round continues; it is never admitted.
+- A topic accepted in an earlier round counts as already researched. The
+  duplicate check is seeded from prior iteration records, so proposing it again
+  is refused as `duplicate`.
 
 ### Step 2. Observation (scripts)
 
@@ -115,8 +124,13 @@ What the scripts do, in order:
    `discovery_verified` is not exactly `true` goes to `candidates_for_review`
    and is never collected.
 3. Ask the compliance gate for a decision on every verified source that has no
-   decision already recorded for that address. A source whose status is not
-   `ALLOWED` is reported in `actions_rejected` and never collected.
+   fresh decision already recorded for that address. A recorded decision is
+   reused only while it is younger than `compliance_recheck_days` (30 by
+   default); a `REVIEW_REQUIRED` record is always re-checked. A source whose
+   status is not `ALLOWED` is reported in `actions_rejected` and never
+   collected. A live user authorisation in
+   `archive/registry/source_policies.jsonl` can release `REVIEW_REQUIRED` to
+   `ALLOWED` (see "Compliance").
 4. Collect each permitted source through `collector.collect`, whose
    `assert_compliance_allows` is the structural backstop.
 5. Deduplicate documents against the archive and against the same round.
@@ -223,9 +237,14 @@ states below. Rules the scripts enforce:
   `rejected_findings` and skipped; it does not destroy the round.
 - Rounds must be applied in order. Re-applying the same round is allowed as a
   retry; an older or skipped round is refused.
+- `next_actions` are validated as action records. An invalid entry is reported
+  in `rejected_next_actions` and skipped; the valid entries are recorded.
 - The apply writes `iterations/round-NNN.json`, `findings/findings.jsonl`,
   `state/current.json`, `summaries/current.md` and `index/manifest.json`, in
-  that order.
+  that order. The iteration record also carries `actions_accepted`,
+  `actions_rejected`, `semantic_candidates` and `rejected_next_actions`, so a
+  refused candidate topic survives the round even though
+  `state/pending_actions.json` is rewritten each round.
 
 ## Handoff and backfill shapes
 
@@ -276,6 +295,8 @@ Round handoff printed by `--round`:
       "reason": "topic 'Example out-of-scope topic' is out of scope: ..."
     }
   ],
+  "actions_accepted": [],
+  "semantic_candidates": [],
   "budget_exhausted": false
 }
 ```
@@ -330,23 +351,75 @@ reachability step makes one request of its own. Those checks are not
 collection. They decide whether collection may happen; a non-`ALLOWED` source
 goes no further.
 
+The transport sends the neutral token `ResearchScout/0.1`, and robots.txt is
+evaluated as the product token `ResearchScout`: the group written for this
+client governs even when no wildcard group exists, and the wildcard group is
+used only when no specific group matches.
+
 The statuses mean different things and must not be merged:
 
 - `ALLOWED`: the checks this tool performs found nothing prohibiting
   collection. It is not a licence.
-- `BLOCKED`: a rule forbids collection.
-- `REVIEW_REQUIRED`: a terms page is declared; a human must decide.
+- `BLOCKED`: a rule forbids collection, or the source refused the reachability
+  request (401, 403 or another 4xx). An access refusal is a `BLOCKED` answer,
+  not an unreachable address.
+- `REVIEW_REQUIRED`: a terms page is declared; a human must decide. Only an
+  explicit user authorisation with a scope and an expiry can release it.
 - `ERROR`: the check could not be completed, for example robots.txt could not
   be read. The source is paused. This never means allowed.
-- `UNREACHABLE`: the source's base URL did not answer the reachability
-  request. The source is paused and does not enter the compliance check. This
-  never means allowed.
+- `UNREACHABLE`: the source's base URL did not answer (timeout, network
+  failure or 5xx). The source is paused and does not enter the compliance
+  check. This never means allowed.
 - `DISCOVERED` and `CHECKING`: no decision has been made yet.
 
 No retry, user-agent change, proxy, delay or other workaround may bypass a
 refusal. Do not re-run a round hoping for a different verdict for a source the
 gate refused. A recorded decision is bound to the domain and address that were
-checked; pointing `base_url` elsewhere triggers a fresh check.
+checked and is re-checked after `compliance_recheck_days` (30 by default);
+pointing `base_url` elsewhere triggers a fresh check.
+
+### Releasing a REVIEW_REQUIRED source
+
+`REVIEW_REQUIRED` never becomes `ALLOWED` by itself. When the user explicitly
+authorises collection, record that authorisation through the policy writer;
+never hand-edit the JSONL. The record names the source, the access method, the
+paths it covers and an `expires_at`. The gate consults it only when its own
+decision is `REVIEW_REQUIRED`; `BLOCKED`, `ERROR` and `UNREACHABLE` can never
+be overridden. Authorisation is a product action, not a legal licence.
+
+```bash
+python3 - <<'PY'
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from scripts.lib.policy import save_policy
+
+root = Path("archive/industry/example-topic")
+state = json.loads((root / "state" / "current.json").read_text(encoding="utf-8"))
+archive_root = state.get("archive_root") or "archive"
+now = datetime.now(timezone.utc)
+save_policy(archive_root, {
+    "source_id": "src_example",
+    "resolved_status": "ALLOWED",
+    "resolved_by": "user",
+    "resolved_at": now.isoformat(),
+    "reason": "The user reviewed the declared terms and authorised automated collection.",
+    "scope": {
+        "paths": ["/"],
+        "access_method": "web",
+        "expires_at": (now + timedelta(days=30)).isoformat(),
+    },
+    "check_record_ref": "src_example",
+})
+print("policy saved")
+PY
+```
+
+Set `scope.paths` to the paths the user authorised (`["/"]` for a whole web
+source, `["/feed"]` for an rss source) and `scope.access_method` to the
+source's method. The next round re-checks the source and, if the policy covers
+it and has not expired, records `ALLOWED` with the policy as evidence. An
+expired or out-of-scope record leaves the source at `REVIEW_REQUIRED`.
 
 An rss or api source needs `feed_url` or `api_url` on the **same origin**
 (scheme, host and port) as `base_url`; a web source is read from `base_url`. An
@@ -374,8 +447,10 @@ replay a round that was already applied.
 
 ## First run
 
-Follow this order exactly. Nothing is collected before the user confirms the
-scope and the sources.
+Follow this order exactly. Scope confirmation gates proposed actions, not an
+action-less collection round: a sources-only round still collects, but only
+from sources that pass the compliance gate. The user confirms which candidate
+sources may be probed and collected.
 
 1. Create the project. The scope starts unconfirmed by design:
 
@@ -473,28 +548,36 @@ candidates = json.loads(Path("candidates.json").read_text(encoding="utf-8"))
 confirmed = set(json.loads(
     Path("confirmed-sources.json").read_text(encoding="utf-8")
 ))
-kept, unreachable = [], []
+kept, unreachable, blocked = [], [], []
 for candidate in candidates:
     if candidate.get("source_id") not in confirmed:
         # An unconfirmed candidate is never probed, verified or collected.
         continue
-    if check_reachability(candidate) == "REACHABLE":
+    answer = check_reachability(candidate)
+    if answer == "REACHABLE":
         candidate["discovery_verified"] = True
         kept.append(candidate)
+    elif answer == "BLOCKED":
+        # 401/403 or another 4xx: the server refused the request.
+        blocked.append(candidate.get("source_id"))
     else:
+        # Timeout, network failure or 5xx: the address did not answer.
         unreachable.append(candidate.get("source_id"))
 Path("sources.json").write_text(
     json.dumps(kept, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
 )
+print("blocked confirmed sources:", blocked)
 print("unreachable confirmed sources:", unreachable)
 PY
 ```
 
 Never probe an unconfirmed candidate: a model-recalled address becomes a real
-request only after the user names it. Reachability only says the address
-answers; it is not a permission decision. The gate still evaluates every source
-in `sources.json` before it can be collected and records `ALLOWED` or refuses
-it.
+request only after the user names it. Reachability only says whether the
+address answers; it is not a permission decision. A refusal (401/403/4xx) is
+`BLOCKED`; a timeout or 5xx is `UNREACHABLE`; neither is permission. The gate
+still evaluates every source in `sources.json` before it can be collected and
+records `ALLOWED` or refuses it. A `REVIEW_REQUIRED` source can later be
+released with the policy snippet in "Compliance".
 
 If a source was named directly by the user (`provider="manual"`), discovery
 already marks it verified; running reachability on it is optional. Such a
@@ -559,6 +642,26 @@ instruction:
 `scripts/viewer.py` is a Phase 5 placeholder and raises `NotImplementedError`.
 The v1 export products are Markdown and CSV only.
 
+Three mechanisms are deliberately absent, and the docs say so rather than
+implying they run:
+
+- **The document state machine is partial.** A document advances only through
+  the states the pipeline actually sets: `FETCHED` (feed entries) or
+  `EXTRACTED` (pages run through the extractor), then `PERSISTED` where a later
+  stage records it. `attempt_count` stays 0 for successful documents;
+  permanent-failure retry and next-round priority are not implemented. The
+  report's "permanent failure" subsection is never populated in v1.
+- **There is no automatic retry.** A 5xx or 429 is a failed fetch for that
+  round; a robots.txt failure is `ERROR` and is never retried. This is a
+  deliberate deviation from spec 10.4's bounded-retry bullet.
+- **The API/feed terms dimension is absent.** An rss or api source without a
+  declared terms URL is evaluated by robots.txt only; the terms and quota
+  dimension of spec 6.3 is not implemented.
+
+`config/default.yaml` also carries keys v1 does not consume (`max_attempts`)
+and `config/iteration.yaml` carries branch/no-progress knobs that no script
+reads. They are declared for compatibility, not enforced.
+
 ## You must not
 
 - Bypass, weaken or route around the compliance gate, or retry a refusal with a
@@ -573,5 +676,7 @@ The v1 export products are Markdown and CSV only.
   document and the schemas.
 - Write `state/pending_actions.json`, mark a source `ALLOWED`, or hand-edit
   `state/current.json`, `findings/findings.jsonl` or the manifest.
+- Hand-edit `archive/registry/source_policies.jsonl`, or treat a user
+  authorisation as a legal licence. Record it through `save_policy`.
 - Continue a round after `budget_exhausted: true`, or continue when there is no
   new evidence and no worthwhile next action.
