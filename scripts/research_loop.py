@@ -34,7 +34,12 @@ Four invariants meet here for the first time.
    round, documents per research, requests per research, runtime and rounds
    are checked here, from ``config/iteration.yaml`` over ``DEFAULTS``. Hitting
    any of them stops collection before the next ``collect`` call; documents
-   already collected are still persisted.
+   already collected are still persisted. The request counter counts **actual
+   fetcher invocations**, not phases entered: the gate makes one to three
+   requests per source, and a single counter increment would undercount the
+   budget by a factor of two or three. The recording wrapper in front of the
+   fetcher also *refuses* a call that would exceed the remaining budget, so
+   the limit cannot be passed even mid-gate.
 
 4. **No host, no data (V11).** ``check_env`` is a pure function and the CLI's
    readiness report writes nothing. A skill that produced half-analysed
@@ -87,7 +92,7 @@ from scripts.archive import (DOCUMENTS_FILE, FINDINGS_FILE, ROUND_DIGITS,
                              SOURCES_FILE, load_state, rebuild_manifest,
                              save_documents, save_findings, save_iteration,
                              save_state, save_summary)
-from scripts.collector import collect
+from scripts.collector import collect, path_is_permitted
 from scripts.compliance_gate import STATUS_ALLOWED, check_compliance
 from scripts.content_extractor import extract_content
 from scripts.deduplicator import dedupe
@@ -135,6 +140,19 @@ HTML_MARKERS = ("<html", "<!doctype", "<body", "<article", "<main",
 # The score fields ``compute_weight`` reads are in-memory inputs, not finding
 # schema fields. They are removed at the agent boundary before validation.
 SCORE_FIELDS = tuple(FINDING_SCORE_FIELDS.values())
+
+# The rejection label for an action that is not a JSON object at all. It is
+# this module's boundary label, deliberately distinct from action_gate's
+# verdicts: no scope, budget or duplicate question can be asked of a value
+# that is not an action record.
+REJECT_INVALID_ACTION = "invalid_action"
+
+# Fields the collector needs that ``source.schema.json`` does not model. They
+# are transport configuration -- where to read the feed or API -- rather than
+# source identity, so schema validation is applied to the record without them.
+# Keeping them on the record is what lets a decision survive across rounds for
+# an RSS or API source.
+TRANSPORT_FIELDS = ("feed_url", "api_url")
 
 # The retention mode this module may claim honestly. The extraction path keeps
 # the metadata and the fingerprint, never the body, so ``reference`` is the
@@ -188,32 +206,63 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
        without a scope, and silently collecting as if it had been is the wrong
        direction.
     2. Resolve sources: the ``sources`` argument, else
-       ``sources/selected_sources.jsonl``. Sources whose
+       ``sources/selected_sources.jsonl``. Every record is schema-validated at
+       this boundary before anything is done with it. A record that is not a
+       JSON object, or that fails ``source.schema.json``, is reported in
+       ``actions_rejected`` (or shown in ``candidates_for_review`` when it is
+       unverified) and is never written to ``selected_sources.jsonl`` and never
+       collected. The two transport fields the collector needs but the v1
+       schema does not model (``feed_url``, ``api_url``) are exempt from that
+       validation; see ``_source_schema_error``. Sources whose
        ``discovery_verified`` is not exactly ``True`` go to
        ``candidates_for_review`` and are **never** collected (spec 8.3, V5);
        that split is program-enforced, not a note in the handoff.
     3. Obtain a compliance decision for every verified source (spec 6.1,
-       invariant 1). A source that carries no ``checked_at`` is checked with
-       ``compliance_gate.check_compliance`` and costs one unit of the request
-       budget; a source that already carries ``checked_at`` keeps its recorded
-       decision and is **not** re-checked. That is what lets a decision survive
-       across rounds. ``config``'s ``compliance_recheck_days`` is not consulted
-       yet -- a deferred refinement -- so a recorded decision is permanent for
-       v1. The merged record is written back to ``sources/selected_sources.jsonl``
-       **after** the check, so the file states the decision that was actually
-       made. A source whose decision is not ``ALLOWED`` is recorded in
-       ``actions_rejected`` and never reaches collection.
+       invariant 1). A source is checked with
+       ``compliance_gate.check_compliance`` when it carries no ``checked_at``
+       **or when its recorded decision was made for another host**: the record
+       is bound to the ``domain`` the gate wrote, so carrying ``checked_at``
+       from an e.org decision while pointing ``base_url`` at evil.example
+       triggers a fresh check instead of reusing a consent for a different
+       site. A matching decision is kept and is **not** re-checked, which is
+       what lets it survive across rounds. ``config``'s
+       ``compliance_recheck_days`` is not consulted yet -- a deferred
+       refinement -- so a matching recorded decision is permanent for v1. The
+       gate counts every fetch it actually makes (one to three: reachability,
+       robots.txt, and a paced re-request when Crawl-delay changes the
+       interval). The merged record is written back to
+       ``sources/selected_sources.jsonl`` **after** the check, so the file
+       states the decision that was actually made. A source whose decision is
+       not ``ALLOWED`` is recorded in ``actions_rejected`` and never reaches
+       collection, and its ``selection_status`` is set to ``pending``; an
+       ``ALLOWED`` source is marked ``selected`` unless the caller had already
+       marked it ``excluded``. Running out of request budget mid-gate is *not*
+       a compliance decision: no verdict is written back for that source.
     4. Collect each permitted source with ``collector.collect``, whose
        ``assert_compliance_allows`` stays as the structural backstop. A
        ``PermissionError`` is reported and the round moves on to the next
-       source; it is never retried or bypassed.
+       source; it is never retried or bypassed. A ``ValueError`` from the
+       collector -- a feed or API target on another host than ``base_url`` --
+       is reported the same way and the round continues: it is a broken source
+       record, not a reason to lose the round.
     5. Extract pages (a web source yields no feed entries, so the captured
-       body is passed to ``extract_content``) and deduplicate the round's
-       documents. ``dedupe`` returns ``(kept, report)``; only ``kept`` is
-       archived, because semantic near-duplicates are a report, not a removal
-       (spec 10.1).
-    6. Persist documents and the cross-round request counter, then assemble the
-       handoff.
+       body is passed to ``extract_content``). Every document is validated
+       against ``document.schema.json`` at its source's boundary; an invalid
+       one is recorded in ``actions_rejected`` and skipped, so one bad record
+       cannot discard the round's other work. The archive layer's
+       validate-before-write remains the backstop. The round's documents are
+       then deduplicated **against the documents already on disk**: the
+       existing records come first and therefore win, so the same article
+       collected in round 2 keeps its round-1 ``document_id`` instead of being
+       archived again (spec 10.1). ``dedupe`` returns ``(kept, report)``;
+       semantic near-duplicates are a report, not a removal.
+    6. Persist only the genuinely new documents, and the cross-round request
+       counter, then assemble the handoff. ``state["requests_used"]`` is
+       written in a ``finally`` block, so a round that fails after spending
+       requests cannot be used to get that budget back. ``budget_exhausted``
+       is re-evaluated at the end: being exactly *at* a limit (requests,
+       documents this round, documents per research, runtime) is exhaustion,
+       not permission for one more.
 
     The round is single-pass: it returns after step 6 and never schedules the
     next one. ``decision`` is the host's to make in ``apply_results``.
@@ -227,6 +276,15 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
     Budgets come from ``config["iteration_policy"]`` merged over
     ``DEFAULTS``; a missing key falls back to the default rather than raising.
     Request usage is cumulative across rounds in ``state/current.json``.
+
+    The round counter is enforced too: ``round_no > max_rounds`` stops before
+    collecting and reports ``budget_exhausted`` with the reason in
+    ``actions_rejected``. A round that ``apply_results`` already recorded
+    cannot be replayed -- ``round_no <= state["round"]`` raises ``ValueError``
+    -- because replaying it would collect the same sources again and count
+    their requests twice. ``apply_results`` writing ``state["round"]`` is what
+    makes replay detectable; ``run_round`` itself never writes the round
+    number, so an unfinished round stays resumable.
     """
     root = Path(root)
     _require_project(root)
@@ -241,13 +299,28 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
 
     state = _load_state_or_empty(root)
     requests_used = _usable_count(state.get("requests_used"))
-    existing_documents = len(read_records(root / DOCUMENTS_FILE))
+
+    # A completed round is recorded by ``apply_results``. Replaying it -- or
+    # an earlier round -- would collect the same sources again and count their
+    # requests twice, so it is refused rather than silently repeated. Round 1
+    # is always valid on a fresh project, where the recorded round is 0.
+    recorded_round = _usable_count(state.get("round"))
+    if recorded_round > 0 and round_no <= recorded_round:
+        raise ValueError(
+            f"round {round_no} has already been recorded (state is at round "
+            f"{recorded_round}); a completed round cannot be replayed"
+        )
+
+    existing_records = read_records(root / DOCUMENTS_FILE)
+    existing_documents = len(existing_records)
     documents_room = policy["max_documents_per_research"] - existing_documents
 
+    rounds_exceeded = round_no > policy["max_rounds"]
     budget_exhausted = (
         documents_room <= 0
         or requests_used >= policy["max_requests_per_research"]
-        or round_no > policy["max_rounds"]
+        or rounds_exceeded
+        or time.monotonic() - started >= policy["max_runtime_minutes"] * 60
     )
 
     accepted_actions = []
@@ -259,6 +332,26 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
         scope = research["scope"]
         budget_view = {"remaining_documents": max(0, documents_room)}
         for action in actions:
+            if not isinstance(action, dict):
+                # The action list crosses the agent boundary, so one malformed
+                # entry must not crash a round that also carries good ones.
+                # ``invalid_action`` is this module's label, not one of
+                # action_gate's verdicts: no gate check was asked of a value
+                # that is not an action record at all.
+                rejected_actions.append({
+                    "action": action,
+                    "verdict": {
+                        "accepted": False,
+                        "rejected_as": REJECT_INVALID_ACTION,
+                        "reason": (
+                            "action must be a JSON object; a non-mapping value "
+                            "cannot be evaluated against the scope"
+                        ),
+                        "scope_list": None,
+                    },
+                    "scope_list": None,
+                })
+                continue
             verdict = evaluate_action(
                 action,
                 scope=scope,
@@ -280,136 +373,222 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
         _write_pending_actions(root, round_no, accepted_actions, rejected_actions)
 
     source_list = _resolve_sources(root, sources)
-    verified_sources, review_sources = _split_sources(source_list)
+    verified_sources, review_sources, writable_review, source_rejections = (
+        _admit_sources(source_list)
+    )
 
     actions_rejected = [_action_rejection(item) for item in rejected_actions]
+    actions_rejected.extend(source_rejections)
+    if rounds_exceeded:
+        actions_rejected.append({
+            "kind": "round",
+            "reason": (
+                f"round {round_no} exceeds max_rounds "
+                f"{policy['max_rounds']}; collection did not start"
+            ),
+        })
+
     collected = []
+    new_documents = []
     sources_path = root / SOURCES_FILE
 
     can_collect = (not actions) or bool(accepted_actions)
-    if can_collect and not budget_exhausted:
-        recorder = _RecordingFetcher(fetcher or _default_fetcher)
-        for source in verified_sources:
-            if budget_exhausted:
-                break
-            if len(collected) >= policy["max_documents_per_round"]:
-                budget_exhausted = True
-                break
-            if existing_documents + len(collected) >= policy["max_documents_per_research"]:
-                budget_exhausted = True
-                break
-            if requests_used >= policy["max_requests_per_research"]:
-                budget_exhausted = True
-                break
-            if time.monotonic() - started >= policy["max_runtime_minutes"] * 60:
-                budget_exhausted = True
-                break
-
-            # A source is permitted only after a check recorded a decision.
-            # ``ALLOWED`` without ``checked_at`` is a claim the round must not
-            # trust, so it is re-checked like any other unchecked source.
-            if source.get("checked_at"):
-                merged = dict(source)
-            else:
-                # The gate is one unit of request budget (it fetches
-                # robots.txt). Counting it before the check is the conservative
-                # direction: the hard limit can be reached early, never
-                # exceeded.
-                requests_used += 1
-                merged = {
-                    **source,
-                    **check_compliance(
-                        source, fetcher=recorder, config=effective_config
-                    ),
-                }
-
-            if merged.get("compliance_status") == STATUS_ALLOWED:
-                merged["selection_status"] = "selected"
-            else:
-                merged.setdefault("selection_status", "pending")
-
-            # Persist only after the decision exists, so the file carries the
-            # status the gate recorded rather than the caller's claim. This is
-            # what makes the decision survive to the next round.
-            upsert_by_id(sources_path, merged, "source_id")
-
-            if merged.get("compliance_status") != STATUS_ALLOWED:
-                actions_rejected.append({
-                    "kind": "source",
-                    "source_id": source.get("source_id"),
-                    "compliance_status": merged.get("compliance_status"),
-                    "reason": _compliance_rejection_reason(merged),
-                })
-                continue
-
-            # The gate may have spent the round's last permitted request.
-            if requests_used >= policy["max_requests_per_research"]:
-                budget_exhausted = True
-                break
-
-            recorder.last = None
-            # A collect call is also one unit of request budget. Counting it
-            # even when the compliance block refuses (no transport request
-            # happens) is the conservative direction: the hard limit can be
-            # reached early, never exceeded.
-            requests_used += 1
-            try:
-                documents = collect(merged, fetcher=recorder, config=effective_config)
-            except PermissionError as exc:
-                # Structural backstop: reaching here means the decision and
-                # the collector disagree. The round reports it and moves on.
-                actions_rejected.append({
-                    "kind": "source",
-                    "source_id": source.get("source_id"),
-                    "reason": str(exc),
-                })
-                continue
-
-            room = min(
-                policy["max_documents_per_round"] - len(collected),
-                policy["max_documents_per_research"] - existing_documents - len(collected),
+    try:
+        if can_collect and not budget_exhausted:
+            # The wrapper is the only place that knows how many transports
+            # actually ran. It refuses a call that would exceed the research's
+            # remaining requests, so the hard limit cannot be passed even in
+            # the middle of a gate check.
+            recorder = _RecordingFetcher(
+                fetcher or _default_fetcher,
+                limit=max(0, policy["max_requests_per_research"] - requests_used),
             )
-            if room <= 0:
-                budget_exhausted = True
-                break
-            if len(documents) > room:
-                documents = documents[:room]
-                budget_exhausted = True
-            collected.extend(documents)
+            for source in verified_sources:
+                if budget_exhausted:
+                    break
+                if len(collected) >= policy["max_documents_per_round"]:
+                    budget_exhausted = True
+                    break
+                if existing_documents + len(collected) >= policy["max_documents_per_research"]:
+                    budget_exhausted = True
+                    break
+                if requests_used >= policy["max_requests_per_research"]:
+                    budget_exhausted = True
+                    break
+                if time.monotonic() - started >= policy["max_runtime_minutes"] * 60:
+                    budget_exhausted = True
+                    break
 
-            if not documents and not budget_exhausted:
-                page = _page_document(merged, recorder.last, effective_config)
-                if page is not None:
-                    collected.append(page)
+                # A source is permitted only after a check recorded a decision,
+                # and only while that decision still describes this host.
+                # ``ALLOWED`` without ``checked_at`` is a claim the round must
+                # not trust, so it is re-checked like any other unchecked
+                # source.
+                if _decision_applies(source):
+                    merged = dict(source)
+                else:
+                    # A recorded robots URL for another host is as stale as
+                    # the decision itself: re-checking must not consult the
+                    # old host's rules and apply them to the new one.
+                    check_source = _drop_offhost_robots_url(source)
+                    before = recorder.invocations
+                    try:
+                        record = check_compliance(
+                            check_source, fetcher=recorder, config=effective_config
+                        )
+                    except _BudgetExhausted:
+                        # The fetch that would have exceeded the budget did not
+                        # happen, but the ones before it did and are counted.
+                        # No verdict exists, so nothing is written back.
+                        budget_exhausted = True
+                        break
+                    finally:
+                        # Counted even when the gate raises: an attempted
+                        # request is a spent one.
+                        requests_used += recorder.invocations - before
+                    merged = {**check_source, **record}
 
-            if budget_exhausted:
-                break
+                if merged.get("compliance_status") == STATUS_ALLOWED:
+                    # An explicit exclusion by the caller is a selection
+                    # decision, not something a permission check may undo.
+                    if merged.get("selection_status") != "excluded":
+                        merged["selection_status"] = "selected"
+                else:
+                    # A stale "selected" must not survive a refusal: the file
+                    # would claim the planner still wants a source the gate
+                    # just refused.
+                    merged["selection_status"] = "pending"
 
-    # An unverified source is a candidate for review, not a collection target,
-    # but its record is kept so the user can see what was proposed.
-    for source in review_sources:
-        upsert_by_id(sources_path, source, "source_id")
+                # Persist only after the decision exists, so the file carries
+                # the status the gate recorded rather than the caller's claim.
+                # This is what makes the decision survive to the next round.
+                upsert_by_id(sources_path, merged, "source_id")
 
-    kept, _report = dedupe(collected)
-    if kept:
-        save_documents(root, kept)
+                if merged.get("compliance_status") != STATUS_ALLOWED:
+                    actions_rejected.append({
+                        "kind": "source",
+                        "source_id": source.get("source_id"),
+                        "compliance_status": merged.get("compliance_status"),
+                        "reason": _compliance_rejection_reason(merged),
+                    })
+                    continue
 
-    state["requests_used"] = requests_used
-    save_state(root, state)
+                # The gate may have spent the round's last permitted request.
+                if requests_used >= policy["max_requests_per_research"]:
+                    budget_exhausted = True
+                    break
+
+                recorder.last = None
+                before = recorder.invocations
+                try:
+                    documents = collect(
+                        merged, fetcher=recorder, config=effective_config
+                    )
+                except _BudgetExhausted:
+                    budget_exhausted = True
+                    break
+                except PermissionError as exc:
+                    # Structural backstop: reaching here means the decision and
+                    # the collector disagree. The round reports it and moves on.
+                    actions_rejected.append({
+                        "kind": "source",
+                        "source_id": source.get("source_id"),
+                        "reason": str(exc),
+                    })
+                    continue
+                except ValueError as exc:
+                    # A target on another host than the source's base URL is a
+                    # misconfiguration of the record, not a transient failure.
+                    # It is reported loudly and the round keeps going.
+                    actions_rejected.append({
+                        "kind": "source",
+                        "source_id": source.get("source_id"),
+                        "reason": str(exc),
+                    })
+                    continue
+                finally:
+                    requests_used += recorder.invocations - before
+
+                candidates = list(documents)
+                if not documents and not budget_exhausted:
+                    page = _page_document(merged, recorder.last, effective_config)
+                    if page is not None:
+                        candidates.append(page)
+
+                # One malformed document must not discard the round's other
+                # work. The archive layer still validates before writing; this
+                # boundary check is what keeps a single bad record from turning
+                # into a failed round after the sources were already written.
+                valid_documents, document_rejections = _validated_documents(
+                    candidates, merged
+                )
+                actions_rejected.extend(document_rejections)
+
+                room = min(
+                    policy["max_documents_per_round"] - len(collected),
+                    policy["max_documents_per_research"] - existing_documents - len(collected),
+                )
+                if room <= 0:
+                    budget_exhausted = True
+                    break
+                if len(valid_documents) > room:
+                    valid_documents = valid_documents[:room]
+                    budget_exhausted = True
+                collected.extend(valid_documents)
+
+                if budget_exhausted:
+                    break
+
+        # An unverified source is a candidate for review, not a collection
+        # target, but a valid record is kept so the user can see what was
+        # proposed. An invalid one is shown in the handoff only.
+        for source in writable_review:
+            upsert_by_id(sources_path, source, "source_id")
+
+        # Deduplicate against what is already on disk. The existing records
+        # come first, so they win: the same article collected again keeps its
+        # original ``document_id`` and is not archived a second time. Only
+        # genuinely new records are written and reported (spec 10.1).
+        existing_objects = {id(record) for record in existing_records}
+        kept, _report = dedupe(existing_records + collected)
+        new_documents = [document for document in kept
+                         if id(document) not in existing_objects]
+        if new_documents:
+            save_documents(root, new_documents)
+    finally:
+        # The request counter is the hard limit's memory (invariant 8). Writing
+        # it here means a round that fails after spending requests cannot be
+        # used to start again with an unspent budget.
+        state["requests_used"] = requests_used
+        save_state(root, state)
+
+    elapsed = time.monotonic() - started
+    if _limits_reached(
+        requests_used=requests_used,
+        documents_this_round=len(new_documents),
+        documents_total=existing_documents + len(new_documents),
+        elapsed=elapsed,
+        policy=policy,
+    ):
+        budget_exhausted = True
 
     current_findings = read_records(root / FINDINGS_FILE)
-    elapsed = time.monotonic() - started
     return {
         "round": round_no,
-        "new_documents": kept,
+        "new_documents": new_documents,
         "candidates_for_review": review_sources,
         "state_summary": summarize_state(current_findings, [], []),
         "remaining_budget": {
-            "documents_this_round": len(kept),
+            "documents_this_round": len(new_documents),
             "documents_remaining": max(
-                0, policy["max_documents_per_research"] - existing_documents - len(kept)
+                0,
+                policy["max_documents_per_research"]
+                - existing_documents
+                - len(new_documents),
             ),
-            "requests_remaining": max(0, policy["max_requests_per_research"] - requests_used),
+            "requests_remaining": max(
+                0, policy["max_requests_per_research"] - requests_used
+            ),
             "runtime_seconds_remaining": max(
                 0.0, policy["max_runtime_minutes"] * 60 - elapsed
             ),
@@ -447,7 +626,9 @@ def apply_results(root, *, handoff, observations, findings, next_actions, decisi
        a. ``iterations/round-NNN.json`` -- what the round did and why;
        b. ``findings/findings.jsonl`` -- the complete merged set;
        c. ``state/current.json`` -- round, status and update time, preserving
-          every existing field (``created_at``, ``archive_root``, ``path``);
+          every existing field (``created_at``, ``archive_root``, ``path``).
+          Recording ``round`` here is what makes a replay detectable: the next
+          ``run_round`` refuses a round number at or below it;
        d. ``summaries/current.md`` -- the current research memory, never a
           concatenation of past rounds (spec 7.2);
        e. ``index/manifest.json`` last, because it counts what was just
@@ -646,23 +827,158 @@ def _resolve_sources(root, sources):
     return list(sources)
 
 
-def _split_sources(sources):
-    """Split sources into (verified, candidates-for-review).
+def _admit_sources(sources):
+    """Validate and split sources, returning ``(verified, review, writable, rejected)``.
 
-    ``discovery_verified is not True`` -- strict identity -- means the source
-    is a model recollection or otherwise unconfirmed. It is shown to the user
-    and never collected: spec 8.3/V5 require confirmation before a remembered
-    source even reaches the compliance check, and this split is what enforces
-    it in code rather than in a comment.
+    This is the source boundary: everything the caller (or the selected-sources
+    file) hands over is untrusted until it passes ``source.schema.json``. The
+    split exists for two separate reasons, and conflating them would be wrong:
+
+    * A record that fails validation is unusable. An unverified one is still
+      worth showing in ``candidates_for_review`` -- the user may recognise it
+      and repair it -- but it is not written to ``selected_sources.jsonl``.
+      A verified (or non-mapping) one goes to ``rejected`` with the schema
+      error, because there is nothing to review in a record whose identity
+      fields are broken.
+    * A valid but unverified record is a review candidate by design, not by
+      schema failure. It is written back so the proposal survives, but it is
+      never collected (spec 8.3, V5).
+
+    ``writable`` is the review subset that may be persisted; ``review`` is the
+    whole list for the handoff. A bad record used to crash the round from
+    ``save_documents`` after the sources had already been written, and the
+    same bad record was then read back next round and crashed it again.
     """
-    verified = []
-    review = []
+    verified, review = [], []
+    writable = []
+    rejected = []
     for source in sources:
-        if isinstance(source, dict) and source.get("discovery_verified") is True:
+        error = _source_schema_error(source)
+        if error is not None:
+            if isinstance(source, dict) and source.get("discovery_verified") is not True:
+                review.append(source)
+            else:
+                rejected.append({
+                    "kind": "source",
+                    "source_id": source.get("source_id")
+                    if isinstance(source, dict) else None,
+                    "reason": f"source record failed schema validation: {error}",
+                })
+            continue
+        if source.get("discovery_verified") is True:
             verified.append(source)
         else:
             review.append(source)
-    return verified, review
+            writable.append(source)
+    return verified, review, writable, rejected
+
+
+def _source_schema_error(source):
+    """Return the schema error for a source record, or ``None`` when valid.
+
+    ``source.schema.json`` forbids unknown properties, but it predates the
+    collector's two transport fields: an RSS source names where to read in
+    ``feed_url`` and an API source in ``api_url``, and neither is part of the
+    schema. They are where to read, not what the source is, so the record is
+    validated without them and they are kept for collection. Every other
+    field -- including the required ``source_id``, ``base_url``,
+    ``compliance_status`` and ``selection_status`` -- is checked exactly as
+    the schema states.
+    """
+    if not isinstance(source, dict):
+        return "source record is not a JSON object"
+    candidate = {key: value for key, value in source.items()
+                 if key not in TRANSPORT_FIELDS}
+    try:
+        validate_record("source", candidate)
+    except ValidationError as exc:
+        return _validation_error_message(exc)
+    return None
+
+
+def _validated_documents(documents, source):
+    """Return ``(valid, rejected)`` for one source's collected documents.
+
+    Each record is validated at its source's boundary so a single malformed
+    document cannot discard the round's other work at the archive write, after
+    the sources and request budget have already been spent. The rejected
+    entry names the source and the document so the handoff can report it.
+
+    ``archive.save_documents`` validates before writing as well; that check
+    remains the backstop, not a duplicate to remove. Both are boundary checks
+    for different callers.
+    """
+    valid = []
+    rejected = []
+    for document in documents:
+        try:
+            validate_record("document", document)
+        except ValidationError as exc:
+            rejected.append({
+                "kind": "document",
+                "source_id": source.get("source_id")
+                if isinstance(source, dict) else None,
+                "document_id": document.get("document_id")
+                if isinstance(document, dict) else None,
+                "reason": f"document failed schema validation: "
+                          f"{_validation_error_message(exc)}",
+            })
+            continue
+        valid.append(document)
+    return valid, rejected
+
+
+def _decision_applies(source):
+    """Return True when a recorded decision was made for this source's host.
+
+    ``check_compliance`` records ``domain`` alongside ``checked_at``. Reusing
+    ``checked_at`` without comparing that domain would bind the decision to
+    the record rather than to the address: a caller could keep the timestamp,
+    point ``base_url`` at another host, and collect from a site no gate ever
+    checked. A decision is therefore reused only when the recorded domain is
+    non-empty and equals the current base URL's host; otherwise the source is
+    re-checked. An absent domain means the record cannot prove what it was
+    checked for, which is the conservative direction to re-check.
+    """
+    if not source.get("checked_at"):
+        return False
+    recorded_domain = source.get("domain")
+    if not isinstance(recorded_domain, str) or not recorded_domain.strip():
+        return False
+    host = _host_of(source.get("base_url"))
+    return bool(host) and recorded_domain.strip().lower() == host
+
+
+def _drop_offhost_robots_url(source):
+    """Return ``source`` without a ``robots_url`` that names another host.
+
+    A recorded decision carries the rules URL it was based on. When the
+    decision is being re-made for a different ``base_url``, keeping that URL
+    would consult the old host's robots.txt and apply the answer to the new
+    one -- the same binding failure one level down. A declared URL on the
+    source's own host is left alone, because that is a legitimate override.
+    """
+    declared = source.get("robots_url")
+    if not declared or _same_host(declared, source.get("base_url")):
+        return source
+    return {key: value for key, value in source.items() if key != "robots_url"}
+
+
+def _limits_reached(*, requests_used, documents_this_round, documents_total,
+                    elapsed, policy):
+    """Return True when any hard limit is at (not past) its bound.
+
+    Being exactly at a limit is exhaustion. The earlier checks only noticed
+    exhaustion when another source was queued, so a round that spent its last
+    permitted request or filled its last document slot reported
+    ``budget_exhausted: false`` while no further work was possible.
+    """
+    return (
+        requests_used >= policy["max_requests_per_research"]
+        or documents_this_round >= policy["max_documents_per_round"]
+        or documents_total >= policy["max_documents_per_research"]
+        or elapsed >= policy["max_runtime_minutes"] * 60
+    )
 
 
 def _compliance_rejection_reason(source):
@@ -682,21 +998,57 @@ def _compliance_rejection_reason(source):
     )
 
 
+class _BudgetExhausted(Exception):
+    """Raised when the next fetch would exceed the research's request budget.
+
+    It is deliberately not a ``PermissionError``: running out of budget says
+    nothing about whether collection is permitted, so the round must not
+    record it as a compliance verdict. ``run_round`` maps it to
+    ``budget_exhausted`` and stops.
+    """
+
+
 class _RecordingFetcher:
-    """A fetcher wrapper that remembers the last response.
+    """A fetcher wrapper that counts requests, caps them, and remembers the last.
+
+    Two jobs, both required by invariants this module owns:
+
+    * **Counting (invariant 8 / V7).** The compliance gate makes one to three
+      requests per source (reachability, robots.txt, a paced re-request), so a
+      counter that adds one per phase undercounts the request budget. The
+      wrapper counts *actual transport invocations*, and ``run_round`` adds
+      the difference around each gate and collect call.
+    * **Refusing.** A call that would exceed the remaining budget raises
+      ``_BudgetExhausted`` before the transport is touched, so the hard limit
+      holds even in the middle of a gate check rather than only between
+      sources.
 
     ``collector.collect`` returns document records and never the body, so a
     page source has nothing for the extractor to read unless the response is
-    kept somewhere. This wrapper keeps the last one; the collector still makes
-    exactly one request per source, and the compliance block still runs before
-    the wrapped fetcher is called.
+    kept somewhere. This wrapper also keeps the last one; the collector still
+    makes exactly one request per source, and the compliance block still runs
+    before the wrapped fetcher is called.
+
+    ``limit`` is the number of requests this round may still make. ``None``
+    means uncapped, which no caller in this module uses. A call that raises in
+    the transport still counts: the attempt was made, and counting only
+    successes is the direction that lets a retry loop spend more than the
+    budget.
     """
 
-    def __init__(self, fetcher):
+    def __init__(self, fetcher, limit=None):
         self._fetcher = fetcher
+        self._limit = limit
+        self.invocations = 0
         self.last = None
 
     def __call__(self, url, **kwargs):
+        if self._limit is not None and self.invocations >= self._limit:
+            raise _BudgetExhausted(
+                f"request budget exhausted: {self.invocations} request(s) "
+                f"already made this round, limit is {self._limit}"
+            )
+        self.invocations += 1
         result = self._fetcher(url, **kwargs)
         self.last = result if isinstance(result, dict) else None
         return result
@@ -720,6 +1072,9 @@ def _page_document(source, response, config):
     * the response must still be on the permitted source's host and scheme,
       so a redirect cannot turn this path into a way around the collector's
       re-check (invariant 1);
+    * the final path must be inside the source's ``allowed_paths``, when the
+      gate recorded any, for the same reason: a redirect into a path the gate
+      never permitted is not collected even when the host matches;
     * the extractor must find some body text -- an empty extract is not a
       document.
 
@@ -736,6 +1091,8 @@ def _page_document(source, response, config):
     target = source.get("base_url") or ""
     final_url = response.get("final_url") or target
     if not _same_host(target, final_url) or not _is_http(final_url):
+        return None
+    if not path_is_permitted(source, final_url):
         return None
 
     text = response.get("text")

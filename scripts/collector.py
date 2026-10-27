@@ -23,15 +23,26 @@ caller that owns them:
 * The scheme is allowlisted. Discovery accepts any scheme with a host, so an
   ``ftp://`` address can arrive here as a source with ``access_method`` of
   ``web``. Such an address is never handed to ``fetch``.
+* The target is bound to the source's own host. An RSS or API source names a
+  dedicated address in ``feed_url``/``api_url``; the compliance gate checks
+  ``base_url``, so a target on another host would turn one consent into a
+  fetch of an arbitrary site. A mismatch is a misconfiguration, not a
+  transient failure, and raises ``ValueError`` naming both hosts before any
+  request. ``collect`` is a public entry point, so this check lives here as
+  well as in the research loop (defence in depth, invariant 1).
+* ``allowed_paths`` is enforced on the final URL. The schema says the
+  collector must not go outside the paths the gate recorded, so a redirect to
+  a disallowed path on the same host is refused rather than archived. An
+  absent or empty list keeps the older behaviour of no path restriction.
 
 Known v1 limitation, accepted rather than fixed here: the redirect re-check
-compares hosts, it does not re-consult robots.txt for the redirected path. A
-redirect from a permitted address to a robots-disallowed path on the *same*
-host is therefore collected. Re-consulting the gate per URL mid-collection
-would invert the stage separation (spec 8.6) and repeat a check the research
-loop already performs per source. The host check is what closes the path that
-actually mattered -- content from a host no gate ever checked entering the
-archive.
+does not re-consult robots.txt for the redirected path. A redirect from a
+permitted address to a robots-disallowed path on the *same* host that is
+inside ``allowed_paths`` is therefore collected. Re-consulting the gate per URL
+mid-collection would invert the stage separation (spec 8.6) and repeat a check
+the research loop already performs per source. The host and allowed-path
+checks close the paths that actually mattered -- content from a host no gate
+ever checked, or from a path the gate never permitted, entering the archive.
 
 Retention is chosen deliberately, never defaulted to keeping the body (spec
 9.6): documents leave here at ``retention_mode`` of ``reference``, carrying the
@@ -390,6 +401,41 @@ def _host_of(url):
         return ""
 
 
+def path_is_permitted(source, url):
+    """Return True when ``url``'s path is inside the source's allowed paths.
+
+    ``allowed_paths`` is the gate's record of the paths it permitted, and
+    ``schemas/source.schema.json`` is explicit that the collector must not go
+    outside them. Membership is a literal prefix match on the parsed path, so
+    ``/public`` permits ``/public`` and ``/public/notes`` but not ``/secret``.
+    The prefixes are compared as recorded -- a caller that writes
+    ``public`` without a leading slash gets a prefix that matches no absolute
+    path, which fails closed rather than silently widening the permission.
+
+    An absent, empty or unusable list means "no path restriction", which is
+    the behaviour every source had before this check existed: the schema does
+    not require ``allowed_paths``, and a source without one has no narrower
+    grant to enforce. A URL whose path cannot be parsed is refused rather than
+    read as unrestricted.
+
+    The helper is public because ``scripts.research_loop`` enforces the same
+    rule on the page-extraction path; one definition keeps the two paths from
+    drifting apart.
+    """
+    allowed = (source or {}).get("allowed_paths")
+    if not isinstance(allowed, list):
+        return True
+    prefixes = [entry for entry in allowed
+                if isinstance(entry, str) and entry]
+    if not prefixes:
+        return True
+    try:
+        path = urlsplit(url or "").path or "/"
+    except ValueError:
+        return False
+    return any(path.startswith(prefix) for prefix in prefixes)
+
+
 def _delay_for(source, config):
     """Return the request delay to use for this source.
 
@@ -480,6 +526,17 @@ def collect(source, *, fetcher=None, config=None):
     refused fetch is not retried, because asking again is how a client tries to
     get past a refusal (spec 10.4).
 
+    One failure is deliberately loud. A target address on a different host
+    from the source's ``base_url`` raises ``ValueError`` before any request:
+    the gate decided about ``base_url``, so consent for that host cannot
+    authorise a fetch of another. This is a broken source record, not a
+    transient condition, and returning an empty list would hide a compliance
+    violation. The research loop records it in ``actions_rejected`` and keeps
+    the round going.
+
+    A fetch that redirects onto a path outside ``allowed_paths`` yields no
+    documents, for the same reason: the gate did not permit that path.
+
     ``retention_mode`` is set deliberately and defaults to ``reference``: the
     link, the metadata the feed stated, and a fingerprint. Keeping a body is
     the caller's explicit choice, because whether a body may be kept is a
@@ -501,6 +558,22 @@ def collect(source, *, fetcher=None, config=None):
         # transport: this project has no compliance story for another protocol.
         return []
 
+    # The gate decided about ``base_url``. A dedicated feed or API address on
+    # another host would make that decision cover a site it never saw, and a
+    # missing host cannot be bound to anything. Both are misconfigurations: a
+    # compliance violation must be loud, not an empty result the caller can
+    # read as "nothing to collect".
+    base_host = _host_of(source.get("base_url"))
+    requested_host = _host_of(target_url)
+    if not base_host or not requested_host or requested_host != base_host:
+        raise ValueError(
+            f"source {source.get('source_id')!r} is misconfigured: its target "
+            f"{target_url!r} is on host {requested_host or '<unreadable>'!r} "
+            f"but its base URL {source.get('base_url')!r} is on host "
+            f"{base_host or '<unreadable>'!r}; the compliance decision covers "
+            f"the base host only (invariant 1)"
+        )
+
     retrieved_at = _now_iso()
     delay = _delay_for(source, config)
     result = _fetch_once(fetcher, target_url, config, delay)
@@ -518,10 +591,13 @@ def collect(source, *, fetcher=None, config=None):
     # the gate permitted, so it is refused instead of archived. Two unreadable
     # hosts must not compare equal, which is why the target's own host has to
     # be non-empty before the comparison is made.
-    requested_host = _host_of(target_url)
     if not requested_host or _host_of(final_url) != requested_host:
         return []
     if not _scheme_allowed(final_url):
+        return []
+    # The final address is what the body actually came from, so the gate's
+    # allowed paths apply to it rather than to the address that was requested.
+    if not path_is_permitted(source, final_url):
         return []
 
     retention_mode = _config_value(config, "retention_mode", RETENTION_REFERENCE)

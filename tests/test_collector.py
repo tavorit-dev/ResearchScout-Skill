@@ -249,6 +249,60 @@ class TestTargetResolution(unittest.TestCase):
         self.assertEqual(len(fetcher.calls), 1)
 
 
+class TestTargetHostBoundToTheSource(unittest.TestCase):
+    """A consent for one host cannot become a fetch of another (invariant 1)."""
+
+    def test_rss_feed_on_another_host_is_a_misconfiguration(self):
+        fetcher = text_fetcher(ATOM_FEED)
+        with self.assertRaises(ValueError) as caught:
+            collect(source(feed_url="https://evil.example/feed"), fetcher=fetcher)
+        self.assertEqual(fetcher.calls, [])
+        self.assertIn("evil.example", str(caught.exception))
+        self.assertIn("e.org", str(caught.exception))
+
+    def test_api_url_on_another_host_is_a_misconfiguration(self):
+        fetcher = text_fetcher(ATOM_FEED)
+        with self.assertRaises(ValueError) as caught:
+            collect(
+                source(access_method="api", feed_url=None,
+                       api_url="https://evil.example/api"),
+                fetcher=fetcher,
+            )
+        self.assertEqual(fetcher.calls, [])
+        self.assertIn("evil.example", str(caught.exception))
+
+    def test_a_feed_on_the_base_host_still_collects(self):
+        docs = collect(source(feed_url="https://e.org/other-feed"),
+                       fetcher=text_fetcher(ATOM_FEED))
+        self.assertEqual(len(docs), 2)
+
+
+class TestAllowedPaths(unittest.TestCase):
+    def test_redirect_into_a_disallowed_path_is_refused(self):
+        docs = collect(
+            source(allowed_paths=["/public"]),
+            fetcher=text_fetcher(ATOM_FEED,
+                                 final_url="https://e.org/secret/feed"),
+        )
+        self.assertEqual(docs, [])
+
+    def test_redirect_inside_an_allowed_path_is_accepted(self):
+        docs = collect(
+            source(allowed_paths=["/public"]),
+            fetcher=text_fetcher(ATOM_FEED,
+                                 final_url="https://e.org/public/feed"),
+        )
+        self.assertEqual(len(docs), 2)
+
+    def test_no_allowed_paths_means_no_path_restriction(self):
+        docs = collect(
+            source(),
+            fetcher=text_fetcher(ATOM_FEED,
+                                 final_url="https://e.org/anywhere/feed"),
+        )
+        self.assertEqual(len(docs), 2)
+
+
 class TestFailedFetchYieldsNothing(unittest.TestCase):
     def _collect_with_outcome(self, outcome):
         def fetcher(url, **kwargs):

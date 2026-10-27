@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from scripts.archive import (load_state, rebuild_manifest, save_documents,
                              save_findings, save_state)
@@ -84,6 +85,10 @@ def source(**overrides):
         "feed_url": "https://e.org/feed",
         "compliance_status": "ALLOWED",
         "checked_at": "2026-10-01T00:00:00+00:00",
+        # ``domain`` is what the gate writes, and it is what binds a recorded
+        # decision to the host it was made for. A fixture that omits it would
+        # model a decision that never was one.
+        "domain": "e.org",
         "discovery_verified": True,
         "selection_status": "selected",
     }
@@ -699,6 +704,360 @@ class TestBudget(TempCase):
         self.assertEqual(budget["documents_remaining"], 200)
         self.assertEqual(budget["requests_remaining"], 1000)
         self.assertEqual(budget["rounds_remaining"], 7)
+
+
+# -- fix round 2: the hard limits and the record boundary -------------------
+
+
+def discovered_source(url="https://e.org"):
+    """Return one DISCOVERED, verified source as discovery produces it."""
+    return discover("agent security", provider="manual", payload=[url])[0]
+
+
+def selected_records(root):
+    return read_records(root / "sources" / "selected_sources.jsonl")
+
+
+class TestRequestBudgetCountsFetches(TempCase):
+    """The counter must count requests actually made, not phases entered."""
+
+    def test_request_budget_counts_every_fetch(self):
+        # Measured before the fix: max=2, one unchecked source with robots
+        # Allow -> three fetches (reachability, robots, collection) while the
+        # state said 2. The third fetch is now refused and the round stops.
+        root = layout_root(self.tmp)
+        fetcher = site_fetcher()
+
+        handoff = run_round(
+            root, round_no=1, actions=[],
+            config={"iteration_policy": {"max_requests_per_research": 2}},
+            fetcher=fetcher, sources=[discovered_source()],
+        )
+
+        self.assertEqual(fetcher.calls,
+                         ["https://e.org", "https://e.org/robots.txt"])
+        self.assertEqual(load_state(root)["requests_used"], 2)
+        self.assertTrue(handoff["budget_exhausted"])
+        self.assertEqual(handoff["remaining_budget"]["requests_remaining"], 0)
+
+    def test_fetch_over_the_request_budget_is_refused(self):
+        # max=1: reachability is the one permitted request; the robots request
+        # would exceed the budget, so the fetcher is not called for it.
+        root = layout_root(self.tmp)
+        fetcher = site_fetcher()
+
+        handoff = run_round(
+            root, round_no=1, actions=[],
+            config={"iteration_policy": {"max_requests_per_research": 1}},
+            fetcher=fetcher, sources=[discovered_source()],
+        )
+
+        self.assertEqual(fetcher.calls, ["https://e.org"])
+        self.assertTrue(handoff["budget_exhausted"])
+        self.assertEqual(load_state(root)["requests_used"], 1)
+        # Running out of budget is not a compliance decision: the source must
+        # not be written back with a verdict the gate never reached.
+        self.assertEqual(selected_records(root), [])
+
+    def test_requests_at_the_limit_mark_the_budget_exhausted(self):
+        # Exactly reaching the limit is exhaustion, not "one more is fine".
+        root = layout_root(self.tmp)
+        handoff = run_round(
+            root, round_no=1, actions=[],
+            config={"iteration_policy": {"max_requests_per_research": 1}},
+            fetcher=text_fetcher(FEED_ONE), sources=[source()],
+        )
+        self.assertEqual(handoff["remaining_budget"]["requests_remaining"], 0)
+        self.assertTrue(handoff["budget_exhausted"])
+
+    def test_documents_at_the_round_limit_mark_the_budget_exhausted(self):
+        root = layout_root(self.tmp)
+        handoff = run_round(
+            root, round_no=1, actions=[],
+            config={"iteration_policy": {"max_documents_per_round": 1}},
+            fetcher=text_fetcher(FEED_ONE), sources=[source()],
+        )
+        self.assertEqual(handoff["remaining_budget"]["documents_this_round"], 1)
+        self.assertTrue(handoff["budget_exhausted"])
+
+
+class TestGateOrdering(TempCase):
+    def test_calls_are_reachability_then_robots_then_collection(self):
+        # Asserted exactly, because the ordering *is* invariant 1: no
+        # collection request may precede the gate's decision.
+        root = layout_root(self.tmp)
+        fetcher = site_fetcher()
+
+        handoff = run_round(
+            root, round_no=1, actions=[],
+            config={"iteration_policy": {}},
+            fetcher=fetcher, sources=[discovered_source()],
+        )
+
+        self.assertEqual(fetcher.calls, [
+            "https://e.org",
+            "https://e.org/robots.txt",
+            "https://e.org",
+        ])
+        self.assertEqual(len(handoff["new_documents"]), 1)
+
+
+class TestInvalidSourceRecords(TempCase):
+    def test_non_mapping_source_is_rejected_without_crashing(self):
+        root = layout_root(self.tmp)
+        fetcher = text_fetcher(FEED_ONE)
+
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=fetcher, sources=[123],
+        )
+
+        self.assertEqual(handoff["new_documents"], [])
+        self.assertEqual(fetcher.calls, [])
+        rejected = [item for item in handoff["actions_rejected"]
+                    if item.get("kind") == "source"]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(selected_records(root), [])
+
+    def test_source_failing_the_schema_is_rejected_and_not_persisted(self):
+        root = layout_root(self.tmp)
+        fetcher = text_fetcher(FEED_ONE)
+
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=fetcher, sources=[source(source_id=123)],
+        )
+
+        self.assertEqual(handoff["new_documents"], [])
+        self.assertEqual(fetcher.calls, [])
+        rejected = [item for item in handoff["actions_rejected"]
+                    if item.get("kind") == "source"]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("source_id", rejected[0]["reason"])
+        self.assertEqual(selected_records(root), [])
+
+    def test_one_bad_source_does_not_discard_the_good_one(self):
+        root = layout_root(self.tmp)
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=text_fetcher(FEED_ONE),
+            sources=[source(source_id=123), source(source_id="src_good")],
+        )
+
+        self.assertEqual(len(handoff["new_documents"]), 1)
+        self.assertEqual([record["source_id"] for record in selected_records(root)],
+                         ["src_good"])
+
+
+GOOD_DOCUMENT = {
+    "document_id": "doc_good",
+    "source_id": "src_feed",
+    "canonical_url": "https://e.org/a1",
+    "crawl_status": "FETCHED",
+    "retention_mode": "reference",
+    "attempt_count": 0,
+}
+
+
+class TestInvalidDocumentRecords(TempCase):
+    def test_a_bad_document_is_skipped_while_the_good_one_persists(self):
+        root = layout_root(self.tmp)
+        bad = {"document_id": "doc_bad"}  # missing required fields
+
+        with mock.patch("scripts.research_loop.collect",
+                        return_value=[bad, dict(GOOD_DOCUMENT)]):
+            handoff = run_round(
+                root, round_no=2, actions=[], config={"iteration_policy": {}},
+                fetcher=text_fetcher(FEED_ONE), sources=[source()],
+            )
+
+        stored = read_records(root / "documents" / "documents.jsonl")
+        self.assertEqual([record["document_id"] for record in stored], ["doc_good"])
+        self.assertEqual([record["document_id"] for record in handoff["new_documents"]],
+                         ["doc_good"])
+        rejected = [item for item in handoff["actions_rejected"]
+                    if item.get("kind") == "document"]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("doc_bad", json.dumps(rejected[0]))
+
+
+class TestCollectorMisconfiguration(TempCase):
+    def test_offhost_feed_is_rejected_and_the_round_continues(self):
+        # The gate decided about e.org; the feed address points elsewhere.
+        # collect refuses before any fetch, and the round still collects from
+        # the next source.
+        root = layout_root(self.tmp)
+        fetcher = text_fetcher(FEED_ONE)
+
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=fetcher,
+            sources=[
+                source(source_id="src_bad", feed_url="https://evil.example/feed"),
+                source(source_id="src_good"),
+            ],
+        )
+
+        self.assertEqual(fetcher.calls, ["https://e.org/feed"])
+        rejected = [item for item in handoff["actions_rejected"]
+                    if item.get("source_id") == "src_bad"]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("evil.example", rejected[0]["reason"])
+        self.assertEqual(len(handoff["new_documents"]), 1)
+
+
+class TestRequestCounterSurvivesFailure(TempCase):
+    def test_requests_used_is_persisted_when_the_round_fails_later(self):
+        root = layout_root(self.tmp)
+        with mock.patch("scripts.research_loop.save_documents",
+                        side_effect=RuntimeError("disk full")):
+            with self.assertRaises(RuntimeError):
+                run_round(root, round_no=1, actions=[],
+                          config={"iteration_policy": {}},
+                          fetcher=text_fetcher(FEED_ONE), sources=[source()])
+
+        # The fetch happened, so the budget spent it even though the round
+        # failed at the write. A crash cannot return the requests.
+        self.assertEqual(load_state(root)["requests_used"], 1)
+
+
+class TestCrossRoundDedup(TempCase):
+    def test_the_same_article_is_not_archived_twice(self):
+        root = layout_root(self.tmp)
+        config = {"iteration_policy": {}}
+
+        first = run_round(root, round_no=1, actions=[], config=config,
+                          fetcher=text_fetcher(FEED_ONE), sources=[source()])
+        second = run_round(root, round_no=2, actions=[], config=config,
+                           fetcher=text_fetcher(FEED_ONE), sources=[source()])
+
+        stored = read_records(root / "documents" / "documents.jsonl")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(len(first["new_documents"]), 1)
+        self.assertEqual(second["new_documents"], [])
+
+
+class TestRoundLimit(TempCase):
+    def test_a_round_beyond_max_rounds_does_not_collect(self):
+        root = layout_root(self.tmp)
+        fetcher = text_fetcher(FEED_ONE)
+
+        handoff = run_round(
+            root, round_no=2, actions=[],
+            config={"iteration_policy": {"max_rounds": 1}},
+            fetcher=fetcher, sources=[source()],
+        )
+
+        self.assertTrue(handoff["budget_exhausted"])
+        self.assertEqual(fetcher.calls, [])
+        self.assertEqual(handoff["remaining_budget"]["rounds_remaining"], 0)
+        self.assertTrue(any(item.get("kind") == "round"
+                            for item in handoff["actions_rejected"]))
+
+    def test_a_replayed_round_is_rejected(self):
+        root = layout_root(self.tmp)
+        handoff = run_round(root, round_no=1, actions=[],
+                            config={"iteration_policy": {}},
+                            fetcher=text_fetcher(FEED_ONE), sources=[source()])
+        apply(root, findings=[], handoff=handoff)
+
+        with self.assertRaises(ValueError):
+            run_round(root, round_no=1, actions=[],
+                      config={"iteration_policy": {}},
+                      fetcher=text_fetcher(FEED_ONE), sources=[source()])
+
+    def test_the_round_after_the_recorded_one_is_allowed(self):
+        root = layout_root(self.tmp)
+        handoff = run_round(root, round_no=1, actions=[],
+                            config={"iteration_policy": {}},
+                            fetcher=text_fetcher(FEED_ONE), sources=[source()])
+        apply(root, findings=[], handoff=handoff)
+
+        next_handoff = run_round(root, round_no=2, actions=[],
+                                 config={"iteration_policy": {}},
+                                 fetcher=text_fetcher(FEED_ONE), sources=[source()])
+        self.assertEqual(next_handoff["round"], 2)
+
+
+class TestAllowedPathsInTheRound(TempCase):
+    def test_redirected_page_outside_allowed_paths_is_not_archived(self):
+        root = layout_root(self.tmp)
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=text_fetcher(PAGE, final_url="https://e.org/secret/page"),
+            sources=[source(source_id="src_page", access_method="web",
+                            feed_url=None, allowed_paths=["/public"])],
+        )
+        self.assertEqual(handoff["new_documents"], [])
+
+    def test_redirected_page_inside_allowed_paths_is_archived(self):
+        root = layout_root(self.tmp)
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=text_fetcher(PAGE, final_url="https://e.org/public/page"),
+            sources=[source(source_id="src_page", access_method="web",
+                            feed_url=None, allowed_paths=["/public"])],
+        )
+        self.assertEqual(len(handoff["new_documents"]), 1)
+
+
+class TestRecordedDecisionBoundToItsHost(TempCase):
+    def test_a_decision_recorded_for_another_base_url_is_rechecked(self):
+        root = layout_root(self.tmp)
+        first = run_round(root, round_no=1, actions=[],
+                          config={"iteration_policy": {}},
+                          fetcher=site_fetcher(), sources=[discovered_source()])
+        recorded = selected_records(root)[0]
+        self.assertEqual(recorded["domain"], "e.org")
+        self.assertTrue(recorded["checked_at"])
+
+        tampered = dict(recorded, base_url="https://evil.example")
+        fetcher = routed_fetcher({
+            "https://evil.example": {
+                "outcome": "ok", "status": 200, "text": FEED_ONE},
+            "https://evil.example/robots.txt": {
+                "outcome": "ok", "status": 200, "text": ROBOTS_ALLOW},
+        })
+        run_round(root, round_no=2, actions=[],
+                  config={"iteration_policy": {}},
+                  fetcher=fetcher, sources=[tampered])
+
+        # The carried checked_at was made for e.org; it does not authorise a
+        # fetch of evil.example without a new decision.
+        self.assertIn("https://evil.example/robots.txt", fetcher.calls)
+
+
+class TestSelectionStatus(TempCase):
+    def test_a_non_allowed_outcome_clears_a_stale_selected_status(self):
+        root = layout_root(self.tmp)
+        run_round(root, round_no=1, actions=[], config={"iteration_policy": {}},
+                  fetcher=missing_fetcher(),
+                  sources=[source(compliance_status="BLOCKED")])
+        self.assertEqual(selected_records(root)[0]["selection_status"], "pending")
+
+    def test_an_excluded_source_is_not_promoted_to_selected(self):
+        root = layout_root(self.tmp)
+        run_round(root, round_no=1, actions=[], config={"iteration_policy": {}},
+                  fetcher=missing_fetcher(),
+                  sources=[source(selection_status="excluded")])
+        self.assertEqual(selected_records(root)[0]["selection_status"], "excluded")
+
+
+class TestNonMappingAction(TempCase):
+    def test_a_non_mapping_action_is_rejected_instead_of_crashing(self):
+        root = project(self.tmp, scope=CONFIRMED_SCOPE)
+        handoff = run_round(
+            root, round_no=1, actions=["not-an-action"],
+            config={"iteration_policy": {}}, fetcher=missing_fetcher(),
+            sources=[],
+        )
+        self.assertEqual(len(handoff["actions_rejected"]), 1)
+        self.assertEqual(handoff["actions_rejected"][0]["rejected_as"],
+                         "invalid_action")
+
+        pending = json.loads(
+            (root / "state" / "pending_actions.json").read_text("utf-8"))
+        self.assertEqual(len(pending["rejected"]), 1)
 
 
 # -- apply_results: the agent boundary --------------------------------------
