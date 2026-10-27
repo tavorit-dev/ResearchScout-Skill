@@ -84,11 +84,11 @@
     },
     "feed_url": {
       "type": "string",
-      "description": "Transport address an rss source is read at. It must name the same host as base_url: the collector refuses a different host, and the compliance gate only ever checked base_url. Empty or absent means the base URL is read instead."
+      "description": "Transport address an rss source is read at. REQUIRED when access_method is rss: an rss source with no non-empty feed_url is refused by the collector, there is no fallback to base_url. The field stays optional in this schema only because web and api sources do not carry it. It must name the same host as base_url: the collector refuses a different host, and the compliance gate evaluates this address's path before collection."
     },
     "api_url": {
       "type": "string",
-      "description": "Transport address an api source is read at. It must name the same host as base_url: the collector refuses a different host, and the compliance gate only ever checked base_url. Empty or absent means the base URL is read instead."
+      "description": "Transport address an api source is read at. REQUIRED when access_method is api: an api source with no non-empty api_url is refused by the collector, there is no fallback to base_url. The field stays optional in this schema only because web and rss sources do not carry it. It must name the same host as base_url: the collector refuses a different host, and the compliance gate evaluates this address's path before collection."
     },
     "last_checked_at": {
       "type": ["string", "null"],

@@ -209,6 +209,67 @@ class TestCompliance(unittest.TestCase):
         self.assertIsInstance(record["notes"], str)
 
 
+class TestTargetUrlIsEvaluated(unittest.TestCase):
+    """The gate evaluates the path that will actually be fetched (fix 4, NEW-7)."""
+
+    def _fetcher(self, robots):
+        return fake_fetcher({
+            "https://e.org": {"outcome": "ok", "status": 200},
+            "https://e.org/robots.txt": {
+                "outcome": "ok", "status": 200, "text": robots,
+            },
+        })
+
+    def _source(self, **overrides):
+        record = {
+            "source_id": "src_1",
+            "base_url": "https://e.org",
+            "access_method": "rss",
+            "feed_url": "https://e.org/feed",
+        }
+        record.update(overrides)
+        return record
+
+    def test_robots_disallowing_the_feed_path_blocks_the_source(self):
+        record = check_compliance(
+            self._source(),
+            fetcher=self._fetcher("User-agent: *\nDisallow: /feed\n"),
+            target_url="https://e.org/feed",
+        )
+        self.assertEqual(record["compliance_status"], "BLOCKED")
+        self.assertEqual(record["allowed_paths"], [])
+
+    def test_without_target_url_the_base_path_is_still_evaluated(self):
+        # Task 7's behaviour is unchanged when no target is supplied.
+        record = check_compliance(
+            self._source(),
+            fetcher=self._fetcher("User-agent: *\nDisallow: /feed\n"),
+        )
+        self.assertEqual(record["compliance_status"], "ALLOWED")
+        self.assertEqual(record["allowed_paths"], ["/"])
+
+    def test_allowed_paths_records_the_evaluated_target_path(self):
+        record = check_compliance(
+            self._source(),
+            fetcher=self._fetcher("User-agent: *\nAllow: /\n"),
+            target_url="https://e.org/feed",
+        )
+        self.assertEqual(record["compliance_status"], "ALLOWED")
+        self.assertEqual(record["allowed_paths"], ["/feed"])
+
+    def test_an_absent_robots_record_is_for_the_target_path(self):
+        fetcher = fake_fetcher({
+            "https://e.org": {"outcome": "ok", "status": 200},
+            "https://e.org/robots.txt": {"outcome": "not_found", "status": 404},
+        })
+        record = check_compliance(
+            self._source(), fetcher=fetcher,
+            target_url="https://e.org/feed",
+        )
+        self.assertEqual(record["compliance_status"], "ALLOWED")
+        self.assertEqual(record["allowed_paths"], ["/feed"])
+
+
 class RecordingFetcher:
     """A fetcher that records the delay each request was issued with."""
 

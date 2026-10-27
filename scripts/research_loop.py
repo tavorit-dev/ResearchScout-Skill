@@ -92,8 +92,10 @@ from scripts.archive import (DOCUMENTS_FILE, FINDINGS_FILE, ROUND_DIGITS,
                              SOURCES_FILE, load_state, rebuild_manifest,
                              save_documents, save_findings, save_iteration,
                              save_state, save_summary)
-from scripts.collector import collect, path_is_permitted
-from scripts.compliance_gate import STATUS_ALLOWED, check_compliance
+from scripts.collector import (collect, path_is_permitted,
+                               target_url as collector_target_url)
+from scripts.compliance_gate import (STATUS_ALLOWED, STATUS_ERROR,
+                                     check_compliance)
 from scripts.content_extractor import extract_content
 from scripts.deduplicator import dedupe
 from scripts.lib.config import DEFAULTS, load_config
@@ -214,11 +216,14 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
     3. Obtain a compliance decision for every verified source (spec 6.1,
        invariant 1). A source is checked with
        ``compliance_gate.check_compliance`` when it carries no ``checked_at``
-       **or when its recorded decision was made for another host**: the record
-       is bound to the ``domain`` the gate wrote, so carrying ``checked_at``
-       from an e.org decision while pointing ``base_url`` at evil.example
-       triggers a fresh check instead of reusing a consent for a different
-       site. A matching decision is kept and is **not** re-checked, which is
+       **or when its recorded decision was made for another address**: the
+       record is bound to the ``domain`` and the checked address the gate
+       wrote, so carrying ``checked_at`` from an e.org decision while pointing
+       ``base_url`` at another host, scheme, port or path triggers a fresh
+       check instead of reusing a consent for an address it never covered. The
+       gate is given the collector's target address (``target_url``), so
+       robots.txt is evaluated for the path that will actually be fetched. A
+       matching decision is kept and is **not** re-checked, which is
        what lets it survive across rounds. ``config``'s
        ``compliance_recheck_days`` is not consulted yet -- a deferred
        refinement -- so a matching recorded decision is permanent for v1. The
@@ -236,9 +241,12 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
        ``assert_compliance_allows`` stays as the structural backstop. A
        ``PermissionError`` is reported and the round moves on to the next
        source; it is never retried or bypassed. A ``ValueError`` from the
-       collector -- a feed or API target on another host than ``base_url`` --
-       is reported the same way and the round continues: it is a broken source
-       record, not a reason to lose the round.
+       collector -- a feed or API target on another host than ``base_url``, or
+       an rss/api source with no transport address -- is reported the same way
+       and the round continues: it is a broken source record, not a reason to
+       lose the round. The refused record is written back as
+       ``ERROR``/``pending`` so the registry does not keep claiming a source
+       is approved after the round refused to collect it.
     5. Extract pages (a web source yields no feed entries, so the captured
        body is passed to ``extract_content``). Every document is validated
        against ``document.schema.json`` at its source's boundary; an invalid
@@ -248,8 +256,13 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
        then deduplicated **against the documents already on disk**: the
        existing records come first and therefore win, so the same article
        collected in round 2 keeps its round-1 ``document_id`` instead of being
-       archived again (spec 10.1). ``dedupe`` returns ``(kept, report)``;
-       semantic near-duplicates are a report, not a removal.
+       archived again (spec 10.1). Dedupe runs incrementally as each source
+       returns, against the archive **and** against what this round has
+       already collected: only genuinely new documents consume the per-round
+       and per-research document budgets, so a source that yields only what is
+       already archived cannot stop a later source from adding new material.
+       ``dedupe`` returns ``(kept, report)``; semantic near-duplicates are a
+       report, not a removal.
     6. Persist only the genuinely new documents, and the cross-round request
        counter, then assemble the handoff. ``state["requests_used"]`` is
        written in a ``finally`` block, so a round that fails after spending
@@ -364,7 +377,11 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
                     "verdict": verdict,
                     "scope_list": verdict["scope_list"],
                 })
-        _write_pending_actions(root, round_no, accepted_actions, rejected_actions)
+
+    # The queue on disk belongs to this round, even when this round proposed
+    # nothing. A host reading the file after an empty round must see an empty
+    # queue, not the previous round's stale one (fix 4, m1).
+    _write_pending_actions(root, round_no, accepted_actions, rejected_actions)
 
     source_list = _resolve_sources(root, sources)
     verified_sources, review_sources, writable_review, source_rejections = (
@@ -385,6 +402,14 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
     collected = []
     new_documents = []
     sources_path = root / SOURCES_FILE
+    # The archive's copy of each source, before this round writes anything.
+    # ``_decision_applies`` compares a carried decision against it, so editing
+    # an in-memory copy's ``base_url`` cannot inherit the address that was
+    # really checked (fix 4, NEW-3).
+    archived_sources = {}
+    for record in read_records(sources_path):
+        if isinstance(record, dict) and isinstance(record.get("source_id"), str):
+            archived_sources[record["source_id"]] = record
 
     can_collect = (not actions) or bool(accepted_actions)
     try:
@@ -418,7 +443,9 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
                 # ``ALLOWED`` without ``checked_at`` is a claim the round must
                 # not trust, so it is re-checked like any other unchecked
                 # source.
-                if _decision_applies(source):
+                if _decision_applies(
+                    source, archived_sources.get(source.get("source_id"))
+                ):
                     merged = dict(source)
                 else:
                     # A recorded robots URL for another host is as stale as
@@ -428,7 +455,14 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
                     before = recorder.invocations
                     try:
                         record = check_compliance(
-                            check_source, fetcher=recorder, config=effective_config
+                            check_source,
+                            fetcher=recorder,
+                            config=effective_config,
+                            # robots.txt is evaluated for the address the
+                            # collector will read, not merely the base URL
+                            # (fix 4, NEW-7). One helper keeps the two
+                            # modules from disagreeing about the target.
+                            target_url=collector_target_url(check_source),
                         )
                     except _BudgetExhausted:
                         # The fetch that would have exceeded the budget did not
@@ -491,14 +525,22 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
                     })
                     continue
                 except ValueError as exc:
-                    # A target on another host than the source's base URL is a
+                    # A target on another host than the source's base URL, or
+                    # an rss/api source missing its transport address, is a
                     # misconfiguration of the record, not a transient failure.
-                    # It is reported loudly and the round keeps going.
+                    # It is reported loudly and the round keeps going. The
+                    # registry must not keep saying ALLOWED/selected for a
+                    # source the round just refused (fix 4, m2).
                     actions_rejected.append({
                         "kind": "source",
                         "source_id": source.get("source_id"),
                         "reason": str(exc),
                     })
+                    upsert_by_id(
+                        sources_path,
+                        _refused_record(merged, exc),
+                        "source_id",
+                    )
                     continue
                 finally:
                     requests_used += recorder.invocations - before
@@ -518,6 +560,17 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
                 )
                 actions_rejected.extend(document_rejections)
 
+                # Dedupe incrementally, against the archive and against what
+                # this round already collected. A re-read of an archived
+                # article is not new material, so it must not consume room in
+                # a budget that exists to bound new material (fix 4, NEW-2).
+                # ``collected`` holds only genuinely new records from here on.
+                already = existing_records + collected
+                kept, _dedupe_report = dedupe(already + valid_documents)
+                already_ids = {id(record) for record in already}
+                fresh = [document for document in kept
+                         if id(document) not in already_ids]
+
                 room = min(
                     policy["max_documents_per_round"] - len(collected),
                     policy["max_documents_per_research"] - existing_documents - len(collected),
@@ -525,10 +578,10 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
                 if room <= 0:
                     budget_exhausted = True
                     break
-                if len(valid_documents) > room:
-                    valid_documents = valid_documents[:room]
+                if len(fresh) > room:
+                    fresh = fresh[:room]
                     budget_exhausted = True
-                collected.extend(valid_documents)
+                collected.extend(fresh)
 
                 if budget_exhausted:
                     break
@@ -653,6 +706,27 @@ def apply_results(root, *, handoff, observations, findings, next_actions, decisi
             f"handoff must carry a non-negative integer 'round', got {round_no!r}"
         )
 
+    # The recorded round only moves forward, one step at a time. Re-applying
+    # the same round is allowed (a retry after a failed write), but applying
+    # an older round would roll ``state.round`` backwards -- re-enabling the
+    # replay ``run_round`` refuses -- and a skipped round would make the
+    # iteration series claim work that never ran. Both are rejected before any
+    # file is written, so a refused apply leaves the archive untouched.
+    state = _load_state_or_empty(root)
+    recorded_round = _usable_count(state.get("round"))
+    if round_no < recorded_round:
+        raise ValueError(
+            f"round {round_no} is older than the recorded round "
+            f"{recorded_round}; applying it would roll the round counter "
+            f"backwards and defeat the replay guard"
+        )
+    if round_no > recorded_round + 1:
+        raise ValueError(
+            f"round {round_no} would skip ahead of the recorded round "
+            f"{recorded_round}; apply the rounds in order (the next round is "
+            f"{recorded_round + 1})"
+        )
+
     # Observations are recorded as the agent sent them, so a malformed backfill
     # stays visible in the iteration. Only the gaps lookup needs a shape.
     gaps = observations.get("knowledge_gaps") if isinstance(observations, dict) else None
@@ -696,7 +770,9 @@ def apply_results(root, *, handoff, observations, findings, next_actions, decisi
     save_iteration(root, round_no, iteration)
     save_findings(root, merged["findings"])
 
-    state = _load_state_or_empty(root)
+    # ``state`` was loaded for the monotonicity check before the first write,
+    # so every existing field (created_at, archive_root, path) is carried
+    # through rather than re-read after this function's own writes.
     state["round"] = round_no
     state["status"] = decision
     state["updated_at"] = _utc_now()
@@ -918,38 +994,141 @@ def _validated_documents(documents, source):
     return valid, rejected
 
 
-def _decision_applies(source):
-    """Return True when a recorded decision was made for this source's host.
+def _evidence_base_url(source):
+    """Return the checked address recorded in evidence, or None.
 
-    ``check_compliance`` records ``domain`` alongside ``checked_at``. Reusing
-    ``checked_at`` without comparing that domain would bind the decision to
-    the record rather than to the address: a caller could keep the timestamp,
-    point ``base_url`` at another host, and collect from a site no gate ever
-    checked. A decision is therefore reused only when the recorded domain is
-    non-empty and equals the current base URL's host; otherwise the source is
-    re-checked. An absent domain means the record cannot prove what it was
-    checked for, which is the conservative direction to re-check.
+    ``check_compliance`` records the address it checked as a ``base_url``
+    evidence entry. That entry is what binds consent to an address: the
+    record's own ``base_url`` field can be edited between rounds, while the
+    evidence still names the address the gate actually consulted.
+    """
+    evidence = source.get("evidence")
+    if isinstance(evidence, list):
+        for item in evidence:
+            if not isinstance(item, dict) or item.get("type") != "base_url":
+                continue
+            url = item.get("url")
+            if isinstance(url, str) and url.strip():
+                return url.strip()
+    return None
+
+
+def _base_url_of(record):
+    """Return a record's non-empty ``base_url``, or None."""
+    if not isinstance(record, dict):
+        return None
+    base = record.get("base_url")
+    if isinstance(base, str) and base.strip():
+        return base.strip()
+    return None
+
+
+def _decision_applies(source, recorded=None):
+    """Return True when a recorded decision was made for this address.
+
+    ``check_compliance`` records ``domain`` and ``checked_at``, and now also
+    the checked address (``_recorded_base_url``). Reusing the decision without
+    comparing them would bind consent to the record rather than to the
+    address: a caller could keep the timestamp, change the host, scheme, port
+    or base path, and collect from an address no gate ever checked.
+
+    A decision is therefore reused only when all of the following hold:
+
+    * ``checked_at`` is present;
+    * the recorded ``domain`` is a non-empty string equal to the current base
+      URL's host (the host check this function has always performed);
+    * the recorded address is present and equal to the current ``base_url``
+      after ``normalize_url``. A normalisation failure (an unreadable port,
+      for example) means the two cannot be proven equal and the source is
+      re-checked.
+
+    ``recorded`` is the source's record as stored in
+    ``sources/selected_sources.jsonl`` before this round, when one exists.
+    Its ``base_url`` is the archive's record of what was checked, so a caller
+    that edits the ``base_url`` of an in-memory copy is still caught even when
+    the record carries no address evidence. A record with neither an evidence
+    entry nor an archived counterpart (a hand-made decision) falls back to its
+    own ``base_url``: there is no second address to compare it with, so the
+    host check is the only binding such a record can prove.
+
+    Any failure re-checks the source, which is the fail-safe direction: a
+    source re-pointed at a new address pays for a check it may not have
+    needed, rather than inheriting consent it never received.
     """
     if not source.get("checked_at"):
         return False
     recorded_domain = source.get("domain")
     if not isinstance(recorded_domain, str) or not recorded_domain.strip():
         return False
-    host = _host_of(source.get("base_url"))
-    return bool(host) and recorded_domain.strip().lower() == host
+    current_base = source.get("base_url")
+    host = _host_of(current_base)
+    if not host or recorded_domain.strip().lower() != host:
+        return False
+    if not isinstance(current_base, str) or not current_base.strip():
+        return False
+
+    recorded_bases = []
+    evidence_base = _evidence_base_url(source)
+    if evidence_base is not None:
+        recorded_bases.append(evidence_base)
+    archived_base = _base_url_of(recorded)
+    if archived_base is not None:
+        recorded_bases.append(archived_base)
+    if not recorded_bases:
+        # No check-time or archived address: the record's own base_url is the
+        # only value there is to compare against.
+        recorded_bases.append(current_base.strip())
+
+    try:
+        current_normalised = normalize_url(current_base.strip())
+        return all(
+            normalize_url(recorded_base) == current_normalised
+            for recorded_base in recorded_bases
+        )
+    except (TypeError, ValueError):
+        # An address that cannot be normalised cannot be proven equal to the
+        # recorded one; re-checking is the conservative answer.
+        return False
+
+
+def _origin_of(url):
+    """Return ``(scheme, host, port)`` for url, or None when unreadable."""
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except (TypeError, ValueError):
+        return None
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if not scheme or not host:
+        return None
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return scheme, host, port
+
+
+def _same_origin(left, right):
+    """Return True when both URLs name the same scheme, host and port."""
+    left_origin = _origin_of(left)
+    return left_origin is not None and left_origin == _origin_of(right)
 
 
 def _drop_offhost_robots_url(source):
-    """Return ``source`` without a ``robots_url`` that names another host.
+    """Return ``source`` without a ``robots_url`` from another origin.
 
     A recorded decision carries the rules URL it was based on. When the
     decision is being re-made for a different ``base_url``, keeping that URL
-    would consult the old host's robots.txt and apply the answer to the new
-    one -- the same binding failure one level down. A declared URL on the
-    source's own host is left alone, because that is a legitimate override.
+    would consult the old origin's robots.txt and apply the answer to the new
+    one -- the same binding failure one level down. The origin, not just the
+    host, is the unit: robots.txt is defined per scheme/host/port, so a
+    scheme or port change makes the recorded URL stale as well. A declared
+    URL on the source's own origin is left alone, because that is a
+    legitimate override.
     """
     declared = source.get("robots_url")
-    if not declared or _same_host(declared, source.get("base_url")):
+    if not declared or _same_origin(declared, source.get("base_url")):
         return source
     return {key: value for key, value in source.items() if key != "robots_url"}
 
@@ -969,6 +1148,29 @@ def _limits_reached(*, requests_used, documents_this_round, documents_total,
         or documents_total >= policy["max_documents_per_research"]
         or elapsed >= policy["max_runtime_minutes"] * 60
     )
+
+
+def _refused_record(source, error):
+    """Return ``source`` marked as refused for a configuration reason.
+
+    A source the collector rejects (an off-host feed, an rss source with no
+    ``feed_url``) was persisted as ``ALLOWED``/``selected`` just before the
+    collection call, so leaving it there would misrepresent a refusal as an
+    approval -- and the next round would read it back and reject it again
+    while the file still claimed it was permitted. The record is written back
+    as ``ERROR``/``pending`` with the reason in ``notes``; the source stays
+    visible for a human to repair, but it no longer looks collectable.
+    """
+    record = dict(source)
+    record["compliance_status"] = STATUS_ERROR
+    record["selection_status"] = "pending"
+    note = f"collection refused for a configuration reason: {error}"
+    existing = record.get("notes")
+    if isinstance(existing, str) and existing.strip():
+        record["notes"] = f"{existing}; {note}"
+    else:
+        record["notes"] = note
+    return record
 
 
 def _compliance_rejection_reason(source):
@@ -1181,8 +1383,10 @@ def _write_pending_actions(root, round_no, accepted, rejected):
     The archive layer owns ``state/current.json``; this file is this module's
     own record of what the gate admitted and refused, including the
     ``scope_list`` that tells a candidate lead from a candidate topic. It is
-    written only when actions were proposed, so a round that proposes nothing
-    does not create an empty queue.
+    written **every round**, including a round that proposed nothing: the
+    file describes the latest round, so an empty round must clear the
+    previous queue rather than leave a stale one for a host to read (fix 4,
+    m1).
     """
     _write_json_atomic(
         Path(root) / PENDING_ACTIONS_FILE,

@@ -52,6 +52,17 @@ FEED_TWO = """<?xml version="1.0" encoding="UTF-8"?>
   </item>
 </channel></rss>"""
 
+FEED_B2 = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+  <title>Example agent-security feed</title>
+  <item>
+    <title>Agent Tool Boundary</title>
+    <link>https://e.org/b2</link>
+    <pubDate>Thu, 22 Oct 2026 00:00:00 GMT</pubDate>
+    <description>Capability boundaries for agent tools.</description>
+  </item>
+</channel></rss>"""
+
 PAGE = """<html><head><title>Agent Runtime Isolation</title></head>
 <body><article><p>Runtime isolation keeps agent tools in a sandbox.</p>
 </article></body></html>"""
@@ -906,6 +917,28 @@ class TestCollectorMisconfiguration(TempCase):
         self.assertEqual(len(handoff["new_documents"]), 1)
 
 
+class TestMissingTransportAddressInTheRound(TempCase):
+    """An rss source with no feed_url is refused loudly (fix 4, NEW-6)."""
+
+    def test_rss_without_feed_url_is_recorded_in_actions_rejected(self):
+        root = layout_root(self.tmp)
+        bad = source(source_id="src_no_feed")
+        bad.pop("feed_url")
+        fetcher = text_fetcher(FEED_ONE)
+
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=fetcher, sources=[bad],
+        )
+
+        self.assertEqual(handoff["new_documents"], [])
+        self.assertEqual(fetcher.calls, [])
+        rejected = [item for item in handoff["actions_rejected"]
+                    if item.get("source_id") == "src_no_feed"]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("feed_url", rejected[0]["reason"])
+
+
 class TestRequestCounterSurvivesFailure(TempCase):
     def test_requests_used_is_persisted_when_the_round_fails_later(self):
         root = layout_root(self.tmp)
@@ -919,6 +952,55 @@ class TestRequestCounterSurvivesFailure(TempCase):
         # The fetch happened, so the budget spent it even though the round
         # failed at the write. A crash cannot return the requests.
         self.assertEqual(load_state(root)["requests_used"], 1)
+
+
+class TestDuplicatesDoNotConsumeTheDocumentQuota(TempCase):
+    """The document budget counts new material, not re-reads (fix 4, NEW-2)."""
+
+    def test_a_duplicate_does_not_stop_a_later_new_document(self):
+        root = layout_root(self.tmp)
+        first = source(source_id="src_one", feed_url="https://e.org/feed1")
+        second = source(source_id="src_two", feed_url="https://e.org/feed2")
+
+        # Round 1 archives A1 from the first source.
+        run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=routed_fetcher({
+                "https://e.org/feed1": {
+                    "outcome": "ok", "status": 200, "text": FEED_ONE},
+            }),
+            sources=[first],
+        )
+        self.assertEqual(
+            [record["canonical_url"]
+             for record in read_records(root / "documents" / "documents.jsonl")],
+            ["https://e.org/a1"],
+        )
+
+        # Round 2 may add ONE document. The first source yields only the
+        # duplicate A1, so it must consume no room: the second source, which
+        # carries the genuinely new B2, is still fetched and archived.
+        fetcher = routed_fetcher({
+            "https://e.org/feed1": {
+                "outcome": "ok", "status": 200, "text": FEED_ONE},
+            "https://e.org/feed2": {
+                "outcome": "ok", "status": 200, "text": FEED_B2},
+        })
+        handoff = run_round(
+            root, round_no=2, actions=[],
+            config={"iteration_policy": {"max_documents_per_round": 1}},
+            fetcher=fetcher, sources=[first, second],
+        )
+
+        self.assertEqual(fetcher.calls,
+                         ["https://e.org/feed1", "https://e.org/feed2"])
+        self.assertEqual(
+            [document["canonical_url"] for document in handoff["new_documents"]],
+            ["https://e.org/b2"],
+        )
+        self.assertEqual(
+            len(read_records(root / "documents" / "documents.jsonl")), 2,
+        )
 
 
 class TestCrossRoundDedup(TempCase):
@@ -986,7 +1068,8 @@ class TestAllowedPathsInTheRound(TempCase):
             root, round_no=1, actions=[], config={"iteration_policy": {}},
             fetcher=text_fetcher(PAGE, final_url="https://e.org/secret/page"),
             sources=[source(source_id="src_page", access_method="web",
-                            feed_url="", allowed_paths=["/public"])],
+                            feed_url="", base_url="https://e.org/public",
+                            allowed_paths=["/public"])],
         )
         self.assertEqual(handoff["new_documents"], [])
 
@@ -996,9 +1079,24 @@ class TestAllowedPathsInTheRound(TempCase):
             root, round_no=1, actions=[], config={"iteration_policy": {}},
             fetcher=text_fetcher(PAGE, final_url="https://e.org/public/page"),
             sources=[source(source_id="src_page", access_method="web",
-                            feed_url="", allowed_paths=["/public"])],
+                            feed_url="", base_url="https://e.org/public",
+                            allowed_paths=["/public"])],
         )
         self.assertEqual(len(handoff["new_documents"]), 1)
+
+    def test_a_page_outside_the_allowed_path_is_not_requested(self):
+        root = layout_root(self.tmp)
+        fetcher = text_fetcher(PAGE)
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=fetcher,
+            sources=[source(source_id="src_page", access_method="web",
+                            feed_url="", base_url="https://e.org/secret",
+                            allowed_paths=["/public"])],
+        )
+        self.assertEqual(handoff["new_documents"], [])
+        # The base URL itself is outside the grant, so no request is made.
+        self.assertEqual(fetcher.calls, [])
 
 
 class TestRecordedDecisionBoundToItsHost(TempCase):
@@ -1027,6 +1125,128 @@ class TestRecordedDecisionBoundToItsHost(TempCase):
         self.assertIn("https://evil.example/robots.txt", fetcher.calls)
 
 
+class TestRecordedDecisionBoundToItsAddress(TempCase):
+    """Consent is for an address, not a host (fix 4, NEW-3)."""
+
+    def _recorded(self):
+        """Run one real check for https://e.org and return its record."""
+        root = layout_root(self.tmp)
+        run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=site_fetcher(), sources=[discovered_source()],
+        )
+        record = selected_records(root)[0]
+        self.assertEqual(record["base_url"], "https://e.org")
+        return root, record
+
+    def _reuse(self, root, record, base_url):
+        """Run round 2 with the recorded decision pointed at base_url."""
+        routes = {
+            base_url: {"outcome": "ok", "status": 200, "text": PAGE},
+            f"{base_url.rstrip('/')}/robots.txt": {
+                "outcome": "ok", "status": 200, "text": ROBOTS_ALLOW},
+        }
+        fetcher = routed_fetcher(routes)
+        handoff = run_round(
+            root, round_no=2, actions=[], config={"iteration_policy": {}},
+            fetcher=fetcher, sources=[dict(record, base_url=base_url)],
+        )
+        return fetcher, handoff
+
+    def test_the_same_base_url_reuses_the_decision(self):
+        root, record = self._recorded()
+        fetcher, _ = self._reuse(root, record, "https://e.org")
+
+        # No re-check: the recorded address is the current one. The only
+        # request is collection of the page itself.
+        self.assertEqual(fetcher.calls, ["https://e.org"])
+
+    def test_the_archived_address_binds_a_record_without_address_evidence(self):
+        # Even when the in-memory record carries no check-time address, the
+        # registry's copy (the "recorded base_url") still names what was
+        # checked, so editing the copy does not inherit it.
+        root, record = self._recorded()
+        without_evidence = {key: value for key, value in record.items()
+                            if key != "evidence"}
+        fetcher, _ = self._reuse(root, without_evidence, "https://e.org/other")
+
+        self.assertIn("https://e.org/robots.txt", fetcher.calls)
+
+    def test_a_different_path_rechecks(self):
+        root, record = self._recorded()
+        fetcher, _ = self._reuse(root, record, "https://e.org/other")
+
+        self.assertIn("https://e.org/robots.txt", fetcher.calls)
+
+    def test_a_different_scheme_rechecks(self):
+        root, record = self._recorded()
+        fetcher, _ = self._reuse(root, record, "http://e.org")
+
+        self.assertIn("http://e.org/robots.txt", fetcher.calls)
+
+    def test_a_different_port_rechecks(self):
+        root, record = self._recorded()
+        fetcher, _ = self._reuse(root, record, "https://e.org:8443")
+
+        self.assertIn("https://e.org:8443/robots.txt", fetcher.calls)
+
+
+class TestRobotsEvaluatesTheFetchedPath(TempCase):
+    """robots.txt is consulted for the path that will be read (fix 4, NEW-7)."""
+
+    def test_a_feed_on_a_disallowed_path_is_blocked_and_not_fetched(self):
+        root = layout_root(self.tmp)
+        unchecked = source()
+        unchecked.pop("checked_at")
+        fetcher = routed_fetcher({
+            "https://e.org": {"outcome": "ok", "status": 200, "text": FEED_ONE},
+            "https://e.org/robots.txt": {
+                "outcome": "ok", "status": 200,
+                "text": "User-agent: *\nDisallow: /feed\n",
+            },
+        })
+
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=fetcher, sources=[unchecked],
+        )
+
+        self.assertEqual(handoff["new_documents"], [])
+        # Reachability and robots.txt ran; the feed itself never did.
+        self.assertEqual(fetcher.calls,
+                         ["https://e.org", "https://e.org/robots.txt"])
+        rejected = [item for item in handoff["actions_rejected"]
+                    if item.get("kind") == "source"]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["compliance_status"], "BLOCKED")
+        self.assertEqual(selected_records(root)[0]["compliance_status"], "BLOCKED")
+
+    def test_an_allowed_feed_path_is_recorded_and_then_collected(self):
+        # The gate records the path it permitted, and the collector's
+        # pre-fetch check accepts exactly that path.
+        root = layout_root(self.tmp)
+        unchecked = source()
+        unchecked.pop("checked_at")
+        fetcher = routed_fetcher({
+            "https://e.org": {"outcome": "ok", "status": 200, "text": FEED_ONE},
+            "https://e.org/robots.txt": {
+                "outcome": "ok", "status": 200, "text": ROBOTS_ALLOW},
+            "https://e.org/feed": {
+                "outcome": "ok", "status": 200, "text": FEED_ONE},
+        })
+
+        handoff = run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=fetcher, sources=[unchecked],
+        )
+
+        self.assertEqual(len(handoff["new_documents"]), 1)
+        self.assertEqual(fetcher.calls,
+                         ["https://e.org", "https://e.org/robots.txt",
+                          "https://e.org/feed"])
+        self.assertEqual(selected_records(root)[0]["allowed_paths"], ["/feed"])
+
+
 class TestSelectionStatus(TempCase):
     def test_a_non_allowed_outcome_clears_a_stale_selected_status(self):
         root = layout_root(self.tmp)
@@ -1041,6 +1261,53 @@ class TestSelectionStatus(TempCase):
                   fetcher=missing_fetcher(),
                   sources=[source(selection_status="excluded")])
         self.assertEqual(selected_records(root)[0]["selection_status"], "excluded")
+
+
+class TestPendingActionsRewrittenEveryRound(TempCase):
+    """The queue on disk belongs to the latest round, even an empty one."""
+
+    def test_an_empty_round_clears_the_previous_queue(self):
+        root = project(self.tmp, scope=CONFIRMED_SCOPE)
+        run_round(
+            root, round_no=1, actions=[action()],
+            config={"iteration_policy": {}}, fetcher=missing_fetcher(),
+            sources=[],
+        )
+        pending = json.loads(
+            (root / "state" / "pending_actions.json").read_text("utf-8"))
+        self.assertEqual([item["action_id"] for item in pending["accepted"]],
+                         ["act_1"])
+
+        run_round(
+            root, round_no=2, actions=[],
+            config={"iteration_policy": {}}, fetcher=missing_fetcher(),
+            sources=[],
+        )
+        pending = json.loads(
+            (root / "state" / "pending_actions.json").read_text("utf-8"))
+        self.assertEqual(pending["round"], 2)
+        self.assertEqual(pending["accepted"], [])
+        self.assertEqual(pending["rejected"], [])
+
+
+class TestMisconfiguredSourceIsPersistedAsRefused(TempCase):
+    """A source refused for its configuration must not look approved."""
+
+    def test_an_offhost_feed_is_persisted_as_refused(self):
+        root = layout_root(self.tmp)
+        run_round(
+            root, round_no=1, actions=[], config={"iteration_policy": {}},
+            fetcher=text_fetcher(FEED_ONE),
+            sources=[source(source_id="src_bad",
+                            feed_url="https://evil.example/feed")],
+        )
+
+        stored = {record["source_id"]: record
+                  for record in selected_records(root)}
+        self.assertIn("src_bad", stored)
+        self.assertNotEqual(stored["src_bad"]["compliance_status"], "ALLOWED")
+        self.assertEqual(stored["src_bad"]["selection_status"], "pending")
+        validate_record("source", stored["src_bad"])
 
 
 class TestNonMappingAction(TempCase):
@@ -1141,6 +1408,46 @@ def apply(root, *, findings, decision="CONTINUE", observations=None,
         next_actions=next_actions or [],
         decision=decision,
     )
+
+
+class TestApplyResultsMonotonicity(TempCase):
+    """Applying a round may not move ``state.round`` backwards or skip one."""
+
+    def test_the_first_round_of_a_fresh_project_is_applied(self):
+        root = layout_root(self.tmp)
+        apply(root, findings=[], handoff={"round": 1})
+        self.assertEqual(load_state(root)["round"], 1)
+
+    def test_a_skipped_round_is_rejected_before_any_write(self):
+        root = layout_root(self.tmp)
+        with self.assertRaises(ValueError) as caught:
+            apply(root, findings=[], handoff={"round": 2})
+        self.assertIn("skip", str(caught.exception).lower())
+        self.assertFalse((root / "iterations" / "round-002.json").exists())
+
+    def test_an_earlier_round_cannot_roll_the_state_back(self):
+        root = layout_root(self.tmp)
+        apply(root, findings=[], handoff={"round": 1})
+        apply(root, findings=[], handoff={"round": 2})
+        self.assertEqual(load_state(root)["round"], 2)
+
+        with self.assertRaises(ValueError) as caught:
+            apply(root, findings=[], handoff={"round": 1})
+        self.assertIn("recorded", str(caught.exception).lower())
+        # State did not move, so the replay guard still refuses round 2.
+        self.assertEqual(load_state(root)["round"], 2)
+        with self.assertRaises(ValueError):
+            run_round(root, round_no=2, actions=[],
+                      config={"iteration_policy": {}},
+                      fetcher=missing_fetcher(), sources=[])
+
+    def test_reapplying_the_same_round_is_allowed(self):
+        # A retry after a failed write re-applies the same round.
+        root = layout_root(self.tmp)
+        apply(root, findings=[], handoff={"round": 1})
+        result = apply(root, findings=[], handoff={"round": 1})
+        self.assertEqual(result["round"], 1)
+        self.assertEqual(load_state(root)["round"], 1)
 
 
 class TestApplyResultsBoundary(TempCase):
