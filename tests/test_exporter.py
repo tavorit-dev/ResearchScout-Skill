@@ -13,10 +13,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.archive import export_csv, save_documents, save_findings, save_iteration
+from scripts.archive import (SOURCES_FILE, export_csv, save_documents,
+                             save_findings, save_iteration)
 from scripts.exporter import export_all, export_markdown_report
+from scripts.lib.jsonl import append_record
 from scripts.lib.paths import ensure_research_layout, research_dir
 from scripts.planner import init_research
+from scripts.reflection import summarize_state
 from scripts.viewer import build
 
 REPORT_REL = Path("reports") / "research-report.md"
@@ -101,6 +104,17 @@ def section(text, title):
     end = rest.find("\n## ")
     if end == -1:
         end = len(rest)
+    return rest[:end]
+
+
+def subsection(text, title):
+    """Return the body under ``### title``, up to the next heading of any level."""
+    marker = "### %s" % title
+    start = text.index(marker) + len(marker)
+    rest = text[start:]
+    ends = [position for position in (rest.find("\n## "), rest.find("\n### "))
+            if position != -1]
+    end = min(ends) if ends else len(rest)
     return rest[:end]
 
 
@@ -218,6 +232,107 @@ class TestPopulatedReport(TestExporterBase):
         self.assertIn("最近一轮新增文档：1", body)
 
 
+class TestCollectionFailures(TestExporterBase):
+    def test_refused_source_and_permanent_failure_are_reported(self):
+        root = new_project(self.tmp)
+        forged = "详情\n## 伪造标题"
+        append_record(root / SOURCES_FILE, {
+            "source_id": "src_blocked",
+            "base_url": "https://e.org/blocked",
+            "compliance_status": "BLOCKED",
+            "selection_status": "excluded",
+            "source_name": "被拒来源",
+            "evidence": [{
+                "type": "robots_txt",
+                "url": "https://e.org/robots.txt",
+                "detail": forged,
+                "note": "被禁止",
+            }],
+        })
+        append_record(root / SOURCES_FILE, {
+            "source_id": "src_allowed",
+            "base_url": "https://e.org/allowed",
+            "compliance_status": "ALLOWED",
+            "selection_status": "selected",
+        })
+        append_record(root / SOURCES_FILE, {
+            "source_id": "src_discovered",
+            "base_url": "https://e.org/discovered",
+            "compliance_status": "DISCOVERED",
+            "selection_status": "pending",
+        })
+        save_documents(root, [
+            make_document("doc_fail", title="失败文档", attempt_count=4,
+                          canonical_url="https://e.org/fail"),
+            make_document("doc_ok", title="正常文档", attempt_count=3),
+        ])
+        text = export_markdown_report(root).read_text(encoding="utf-8")
+
+        refused = subsection(text, "未获准采集的来源")
+        self.assertIn("src_blocked", refused)
+        self.assertIn("BLOCKED", refused)
+        self.assertIn("被拒来源", refused)
+        self.assertIn("https://e.org/blocked", refused)
+        self.assertIn("robots_txt", refused)
+        self.assertIn("https://e.org/robots.txt", refused)
+        self.assertIn("被禁止", refused)
+        self.assertNotIn("src_allowed", refused)
+        # No compliance decision has been made for a DISCOVERED source.
+        self.assertNotIn("src_discovered", refused)
+
+        failed = subsection(text, "永久失败文档（attempt_count > 3）")
+        self.assertIn("doc_fail", failed)
+        self.assertIn("失败文档", failed)
+        self.assertIn("尝试次数 4", failed)
+        self.assertIn("https://e.org/fail", failed)
+        self.assertNotIn("doc_ok", failed)
+
+        for line in text.splitlines():
+            self.assertNotEqual(line.strip(), "## 伪造标题")
+        self.assertNotIn("\n## 伪造标题", text)
+
+
+class TestImportantDocuments(TestExporterBase):
+    def test_lists_every_document_with_status_scores_and_relevance_order(self):
+        root = new_project(self.tmp)
+        save_documents(root, [
+            make_document("doc_low", title="低相关文档", relevance_score=0.1),
+            make_document("doc_high", title="高相关文档", relevance_score=0.9,
+                          authority_score=0.7),
+            make_document("doc_unscored", title="无评分文档"),
+        ])
+        text = export_markdown_report(root).read_text(encoding="utf-8")
+        body = section(text, "重要资料")
+        self.assertIn("状态 PERSISTED", body)
+        self.assertIn("相关性 0.9", body)
+        self.assertIn("权威性 0.7", body)
+        self.assertIn("相关性 0.1", body)
+        self.assertIn("无评分文档", body)
+        self.assertLess(body.index("高相关文档"), body.index("低相关文档"))
+        self.assertLess(body.index("低相关文档"), body.index("无评分文档"))
+
+
+class TestFindingOrderIsShared(TestExporterBase):
+    def test_summary_and_report_order_findings_identically(self):
+        root = new_project(self.tmp)
+        save_documents(root, [make_document("doc_1", title="标题")])
+        evidence = [{"document_id": "doc_1", "evidence_type": "supports"}]
+        findings = [
+            make_finding("find_low", "低重要性结论", evidence, importance=0.2),
+            make_finding("find_high", "高重要性结论", evidence, importance=0.9),
+        ]
+        save_findings(root, findings)
+
+        report_body = section(
+            export_markdown_report(root).read_text(encoding="utf-8"),
+            "主要发现")
+        summary_body = section(summarize_state(findings, [], []), "关键发现")
+        self.assertLess(summary_body.index("高重要性结论"),
+                        summary_body.index("低重要性结论"))
+        self.assertLess(report_body.index("高重要性结论"),
+                        report_body.index("低重要性结论"))
+
+
 class TestUntrustedTextCannotForgeStructure(TestExporterBase):
     def setUp(self):
         super().setUp()
@@ -273,6 +388,10 @@ class TestEmptyProject(TestExporterBase):
         self.assertIn("文档总数：0", collection)
         self.assertIn("信息源总数：0", collection)
         self.assertIn("已记录轮次：0", collection)
+        self.assertIn("### 未获准采集的来源", collection)
+        self.assertIn("### 永久失败文档（attempt_count > 3）", collection)
+        self.assertIn("（暂无）", subsection(text, "未获准采集的来源"))
+        self.assertIn("（暂无）", subsection(text, "永久失败文档（attempt_count > 3）"))
         # No state file exists; the report must not read that as round 0.
         self.assertNotIn("第 0 轮", text)
         history = section(text, "历史资料")

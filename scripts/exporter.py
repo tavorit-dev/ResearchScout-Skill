@@ -37,7 +37,6 @@ root rather than creating a directory tree that makes a typo look like a
 project.
 """
 import json
-import math
 import re
 from collections import Counter
 from datetime import date, datetime
@@ -53,15 +52,34 @@ from scripts.archive import (
 )
 from scripts.lib.jsonl import read_records
 from scripts.lib.markdown import neutralise_line
+from scripts.lib.render import (
+    EMPTY_MARKER,
+    action_line,
+    evidence_list,
+    finding_id_of,
+    format_number,
+    is_real_number,
+    sort_findings,
+    statement_of,
+)
 from scripts.planner import load_research
 
 # The report's location below the research root, and the directory it needs.
 REPORTS_DIR = Path("reports")
 REPORT_FILE = REPORTS_DIR / "research-report.md"
 
-# Rendered in a section that has nothing to report. An empty section with no
-# marker is a malformed document; the marker keeps the shape readable.
-EMPTY_MARKER = "（暂无）"
+# Compliance outcomes that mean the gate refused or could not clear a source.
+# DISCOVERED and CHECKING are deliberately absent: no decision has been made
+# for them yet, so they are not "refused".
+REFUSED_COMPLIANCE_STATUSES = (
+    "BLOCKED",
+    "ERROR",
+    "REVIEW_REQUIRED",
+    "UNREACHABLE",
+)
+
+# A document is a permanent failure above this many attempts (spec 10.3).
+PERMANENT_FAILURE_ATTEMPTS = 3
 
 # The nine sections the plan names, in this exact order.
 SECTION_TITLES = (
@@ -255,7 +273,13 @@ def _goal_lines(research):
 
 
 def _collection_lines(state, documents, sources, round_count, latest):
-    """Render factual counts only, never an interpretation of them."""
+    """Render factual counts, then the refused sources and failed documents.
+
+    The two subsections are required by spec 13 (a reader must be able to see
+    why a source was not collected) and spec 10.3 (a document that failed
+    permanently must not vanish from the report). They are counts plus
+    recorded evidence, not a judgement about the source.
+    """
     lines = ["- 文档总数：%d" % len(documents)]
 
     statuses = Counter(
@@ -288,12 +312,125 @@ def _collection_lines(state, documents, sources, round_count, latest):
     new_documents = handoff.get("new_documents") if isinstance(handoff, dict) else None
     if _is_count(new_documents):
         lines.append("- 最近一轮新增文档：%d" % new_documents)
+
+    lines.append("")
+    lines.append("### 未获准采集的来源")
+    lines.append("")
+    refused = _refused_source_lines(sources)
+    lines.extend(refused if refused else [EMPTY_MARKER])
+
+    lines.append("")
+    lines.append("### 永久失败文档（attempt_count > %d）"
+                 % PERMANENT_FAILURE_ATTEMPTS)
+    lines.append("")
+    failed = _failed_document_lines(documents)
+    lines.extend(failed if failed else [EMPTY_MARKER])
     return lines
+
+
+def _refused_source_lines(sources):
+    """List sources the gate refused, with the evidence it recorded.
+
+    Only outcomes that mean "not allowed / could not be cleared" are listed;
+    DISCOVERED and CHECKING have no decision yet and must not read as a
+    refusal. The recorded ``evidence`` items carry the audit trail (spec 13),
+    so they are rendered field by field, neutralised.
+    """
+    refused = [
+        source for source in sources
+        if isinstance(source, dict)
+        and source.get("compliance_status") in REFUSED_COMPLIANCE_STATUSES
+    ]
+    refused.sort(key=_source_sort_key)
+
+    lines = []
+    for source in refused:
+        source_id = source.get("source_id")
+        if not isinstance(source_id, str) or not source_id:
+            source_id = "（无 ID）"
+        status = source.get("compliance_status")
+        heading = "- `%s`（%s）" % (
+            neutralise_line(source_id), neutralise_line(status))
+
+        details = []
+        source_name = source.get("source_name")
+        if isinstance(source_name, str) and source_name.strip():
+            details.append("**%s**" % neutralise_line(source_name))
+        base_url = source.get("base_url")
+        if isinstance(base_url, str) and base_url.strip():
+            details.append(neutralise_line(base_url))
+        if details:
+            heading += "：" + "；".join(details)
+        lines.append(heading)
+
+        evidence = source.get("evidence")
+        if isinstance(evidence, list):
+            for item in evidence:
+                lines.append(_source_evidence_line(item))
+    return lines
+
+
+def _source_evidence_line(item):
+    """Render one source evidence item; a non-mapping item still shows."""
+    if not isinstance(item, dict):
+        return "  - 证据：%s" % neutralise_line(item)
+
+    evidence_type = item.get("type")
+    line = "  - 证据"
+    if isinstance(evidence_type, str) and evidence_type.strip():
+        line += "（%s）" % neutralise_line(evidence_type)
+
+    details = []
+    for field in ("url", "detail", "note"):
+        value = item.get(field)
+        if isinstance(value, str) and value.strip():
+            details.append(neutralise_line(value))
+    if details:
+        line += "：" + "；".join(details)
+    return line
+
+
+def _failed_document_lines(documents):
+    """List documents whose attempts exceeded the permanent-failure limit."""
+    failed = [
+        document for document in documents
+        if isinstance(document, dict)
+        and _is_permanent_failure(document.get("attempt_count"))
+    ]
+    failed.sort(key=lambda document: _document_id_of(document))
+
+    lines = []
+    for document in failed:
+        title = document.get("title")
+        if not (isinstance(title, str) and title.strip()):
+            title = "（无标题）"
+        line = "- `%s`（**%s**）：尝试次数 %d" % (
+            _document_id_of(document),
+            neutralise_line(title),
+            document["attempt_count"],
+        )
+        url = document.get("canonical_url")
+        if isinstance(url, str) and url.strip():
+            line += "；%s" % neutralise_line(url)
+        lines.append(line)
+    return lines
+
+
+def _source_sort_key(source):
+    """Order sources by id so the report is deterministic."""
+    source_id = source.get("source_id")
+    return source_id if isinstance(source_id, str) else ""
+
+
+def _is_permanent_failure(value):
+    """True for a non-bool int strictly above the failure attempt limit."""
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and value > PERMANENT_FAILURE_ATTEMPTS)
 
 
 def _finding_lines(findings):
     """Render cross-document conclusions as labelled inferences."""
-    ordered = _sort_findings(findings)
+    ordered = sort_findings(findings)
     if not ordered:
         return []
     lines = [
@@ -301,16 +438,16 @@ def _finding_lines(findings):
         "",
     ]
     for finding in ordered:
-        lines.append("- **%s**（推断）" % _statement_of(finding))
-        meta = ["`%s`" % _finding_id_of(finding)]
-        confidence = _format_number(finding.get("confidence"))
+        lines.append("- **%s**（推断）" % statement_of(finding))
+        meta = ["`%s`" % finding_id_of(finding)]
+        confidence = format_number(finding.get("confidence"))
         if confidence is not None:
             meta.append("置信度 %s" % confidence)
-        importance = _format_number(finding.get("importance"))
+        importance = format_number(finding.get("importance"))
         if importance is not None:
             meta.append("重要性 %s" % importance)
         lines.append("  - %s" % "；".join(meta))
-        for piece in _evidence_list(finding):
+        for piece in evidence_list(finding):
             lines.append(_evidence_line(piece))
         for label, field in (
             ("适用范围", "scope"),
@@ -354,8 +491,14 @@ def _evidence_line(piece):
 
 
 def _document_lines(documents):
-    """Render first-layer facts plus second-layer analysis, per document."""
-    ordered = _sort_documents(documents)
+    """Render first-layer facts plus second-layer analysis, per document.
+
+    Every document record is listed: choosing which ones are "important" is a
+    semantic judgement a deterministic script must not make. The recorded
+    relevance and authority scores are shown for the reader to judge, and the
+    ordering is relevance first (spec 9.7's ranking input), then recency.
+    """
+    ordered = _sort_documents_by_relevance(documents)
     if not ordered:
         return []
     lines = [
@@ -367,8 +510,16 @@ def _document_lines(documents):
         title = document.get("title")
         if not (isinstance(title, str) and title.strip()):
             title = "（无标题）"
-        lines.append("- **%s**（`%s`）"
-                     % (neutralise_line(title), _document_id_of(document)))
+        status = document.get("crawl_status")
+        if isinstance(status, str) and status.strip():
+            lines.append("- **%s**（`%s`，状态 %s）"
+                         % (neutralise_line(title),
+                            _document_id_of(document),
+                            neutralise_line(status)))
+        else:
+            lines.append("- **%s**（`%s`）"
+                         % (neutralise_line(title),
+                            _document_id_of(document)))
 
         url = document.get("canonical_url")
         if isinstance(url, str) and url.strip():
@@ -388,6 +539,10 @@ def _document_lines(documents):
         if isinstance(author, str) and author.strip():
             lines.append("  - 作者：%s" % neutralise_line(author))
 
+        scores = _document_scores_line(document)
+        if scores is not None:
+            lines.append(scores)
+
         published = document.get("published_at")
         published_text = (
             neutralise_line(published)
@@ -406,6 +561,20 @@ def _document_lines(documents):
         if isinstance(summary, str) and summary.strip():
             lines.append("  - 摘要：%s" % neutralise_line(summary))
     return lines
+
+
+def _document_scores_line(document):
+    """Render the recorded ranking scores; ``None`` when neither is a number."""
+    parts = []
+    relevance = document.get("relevance_score")
+    if is_real_number(relevance):
+        parts.append("相关性 %s" % format_number(relevance))
+    authority = document.get("authority_score")
+    if is_real_number(authority):
+        parts.append("权威性 %s" % format_number(authority))
+    if not parts:
+        return None
+    return "  - 评分：%s" % "；".join(parts)
 
 
 def _trend_lines(latest):
@@ -443,9 +612,9 @@ def _contradiction_lines(findings, latest):
     lines = ["- %s" % neutralise_line(item)
              for item in _items(observations, "contradictions")]
 
-    for finding in _sort_findings(findings):
+    for finding in sort_findings(findings):
         documents = []
-        for piece in _evidence_list(finding):
+        for piece in evidence_list(finding):
             if not isinstance(piece, dict):
                 continue
             if piece.get("evidence_type") != "contradicts":
@@ -457,7 +626,7 @@ def _contradiction_lines(findings, latest):
         if documents:
             lines.append(
                 "- **%s**（`%s`）：%s 提出相反证据（contradicts）"
-                % (_statement_of(finding), _finding_id_of(finding),
+                % (statement_of(finding), finding_id_of(finding),
                    "、".join(documents))
             )
     return lines
@@ -487,7 +656,7 @@ def _history_lines(research, documents):
         lines.append("- 时间窗口起始无法解析（按开放处理），不单列历史资料。")
     else:
         historical = [
-            document for document in _sort_documents(documents)
+            document for document in _sort_documents_by_date(documents)
             if _is_before(document.get("published_at"), start_date)
         ]
         if not historical:
@@ -528,31 +697,8 @@ def _action_lines(latest):
     if isinstance(decision, str) and decision.strip():
         lines.append("- 本轮决策：`%s`" % neutralise_line(decision))
     for action in _items(latest, "next_actions"):
-        lines.append(_action_line(action))
+        lines.append(action_line(action))
     return lines
-
-
-def _action_line(action):
-    """Render one next action, mirroring reflection's action shape."""
-    if not isinstance(action, dict):
-        return "- %s" % neutralise_line(action)
-    headline = ""
-    topic = action.get("topic")
-    if isinstance(topic, str) and topic.strip():
-        headline = "**%s**" % neutralise_line(topic)
-    action_type = action.get("type")
-    if isinstance(action_type, str) and action_type.strip():
-        if headline:
-            headline += "（`%s`）" % neutralise_line(action_type)
-        else:
-            headline = "`%s`" % neutralise_line(action_type)
-    pieces = [headline] if headline else []
-    reason = action.get("reason")
-    if isinstance(reason, str) and reason.strip():
-        pieces.append(neutralise_line(reason))
-    if not pieces:
-        return "- （该行动未提供 topic/type/reason）"
-    return "- " + "：".join(pieces)
 
 
 # -- small shared helpers ---------------------------------------------------
@@ -583,26 +729,6 @@ def _items(container, key):
             and not (isinstance(item, str) and not item.strip())]
 
 
-def _evidence_list(record):
-    """Return a finding's evidence list, tolerating dirty data."""
-    value = record.get("evidence")
-    return value if isinstance(value, list) else []
-
-
-def _statement_of(finding):
-    statement = finding.get("statement")
-    if isinstance(statement, str) and statement.strip():
-        return neutralise_line(statement)
-    return "（无陈述）"
-
-
-def _finding_id_of(finding):
-    finding_id = finding.get("finding_id")
-    if isinstance(finding_id, str) and finding_id:
-        return neutralise_line(finding_id)
-    return "（无 ID）"
-
-
 def _document_id_of(document):
     document_id = document.get("document_id")
     if isinstance(document_id, str) and document_id:
@@ -610,37 +736,44 @@ def _document_id_of(document):
     return "（无 ID）"
 
 
-def _sort_findings(findings):
-    """Order findings by importance descending, then by ``finding_id``.
-
-    The order matches ``reflection.summarize_state`` so the report and the
-    current summary do not disagree about what matters most.
-    """
-    def key(finding):
-        importance = finding.get("importance")
-        if isinstance(importance, bool) or not isinstance(
-                importance, (int, float)):
-            importance = 0.0
-        elif not math.isfinite(importance):
-            importance = 0.0
-        return (-float(importance), _finding_id_of(finding))
-
-    return sorted(
-        (item for item in findings if isinstance(item, dict)), key=key)
-
-
-def _sort_documents(documents):
+def _sort_documents_by_date(documents):
     """Order documents by publication date descending, unknown dates last.
 
     Publication date is stated by the page or null; nothing is inferred. A
     document with no parseable date sorts after dated ones and is never
-    placed on the timeline.
+    placed on the timeline. This is the ordering the historical section uses.
     """
     def key(document):
         published = _as_date(document.get("published_at"))
         if published is None:
             return (1, 0, _document_id_of(document))
         return (0, -published.toordinal(), _document_id_of(document))
+
+    return sorted(
+        (item for item in documents if isinstance(item, dict)), key=key)
+
+
+def _sort_documents_by_relevance(documents):
+    """Order documents by relevance, then recency, then id.
+
+    The report may not decide which documents are "important" -- that is a
+    semantic judgement -- so it lists every record and orders them by the
+    recorded relevance score (highest first, missing last), then by
+    publication date (newest first, unknown last), then by ``document_id``.
+    """
+    def key(document):
+        relevance = document.get("relevance_score")
+        if is_real_number(relevance):
+            relevance_key = (0, -float(relevance))
+        else:
+            relevance_key = (1, 0.0)
+        published = _as_date(document.get("published_at"))
+        if published is None:
+            date_key = (1, 0)
+        else:
+            date_key = (0, -published.toordinal())
+        return (relevance_key[0], relevance_key[1],
+                date_key[0], date_key[1], _document_id_of(document))
 
     return sorted(
         (item for item in documents if isinstance(item, dict)), key=key)
@@ -698,12 +831,3 @@ def _date_label(value):
     if isinstance(value, str) and value.strip():
         return neutralise_line(value)
     return "未设置"
-
-
-def _format_number(value):
-    """Render a number compactly, or ``None`` when it is not usable."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    if not math.isfinite(value):
-        return None
-    return "%g" % value
