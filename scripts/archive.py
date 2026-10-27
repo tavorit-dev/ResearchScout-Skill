@@ -109,11 +109,13 @@ def _require_project(root, subdir):
 def save_state(root, state):
     """Atomically write the current research state to ``state/current.json``.
 
-    ``state`` is a mapping the caller owns; this module does not define its
-    fields. It **must be a mapping**, because ``load_state`` reads the file
-    back as a JSON object: writing a list or scalar would replace the
-    resumable state with something the reader rejects, so that shape is
-    refused with ``TypeError`` before anything reaches disk.
+    ``state`` is a dict the caller owns; this module does not define its
+    fields. It **must be a dict** (a JSON object), because ``load_state``
+    reads the file back as a JSON object: writing a list or scalar would
+    replace the resumable state with something the reader rejects, so that
+    shape is refused with ``TypeError`` before anything reaches disk. An
+    arbitrary ``Mapping`` that is not a dict is refused too -- ``json.dumps``
+    would not serialise it.
 
     ``state/`` must already exist (see ``_require_project``). The write goes
     through a same-directory temporary file and ``os.replace``, so a run
@@ -122,7 +124,7 @@ def save_state(root, state):
     """
     if not isinstance(state, dict):
         raise TypeError(
-            f"research state must be a mapping (a JSON object), got "
+            f"research state must be a dict (a JSON object), got "
             f"{type(state).__name__}"
         )
     root = _require_project(root, STATE_FILE.parent)
@@ -265,9 +267,10 @@ def save_iteration(root, round_no, record):
 
     ``round_no`` is zero-padded so the files sort chronologically as text.
     The record is serialised as JSON; no schema is defined for an iteration
-    record, whose shape is the caller's (Task 16), but it **must be a
-    mapping** so the file is always a JSON object rather than a bare scalar
-    or list.
+    record, whose shape is the caller's (Task 16), but it **must be a dict**
+    (a JSON object) so the file is always a JSON object rather than a bare
+    scalar or list. An arbitrary ``Mapping`` that is not a dict is refused
+    too -- ``json.dumps`` would not serialise it.
 
     ``iterations/`` must already exist (see ``_require_project``).
 
@@ -277,7 +280,7 @@ def save_iteration(root, round_no, record):
         ``round_no`` is not a non-negative integer. A bool is not a round
         number even though Python calls it an int.
     TypeError
-        ``record`` is not a mapping.
+        ``record`` is not a dict (a JSON object).
     """
     if isinstance(round_no, bool) or not isinstance(round_no, int) or round_no < 0:
         raise ValueError(
@@ -285,7 +288,7 @@ def save_iteration(root, round_no, record):
         )
     if not isinstance(record, dict):
         raise TypeError(
-            f"iteration record must be a mapping (a JSON object), got "
+            f"iteration record must be a dict (a JSON object), got "
             f"{type(record).__name__}"
         )
     root = _require_project(root, ITERATIONS_DIR)
@@ -332,7 +335,7 @@ def rebuild_manifest(root):
 
     The returned dict is the one written to the file.
     """
-    root = Path(root)
+    root = _require_project(root, MANIFEST_FILE.parent)
     manifest = {
         "document_count": len(read_records(root / DOCUMENTS_FILE)),
         "finding_count": len(read_records(root / FINDINGS_FILE)),
@@ -383,10 +386,13 @@ def _atomic_write_text(path, text):
             f"cannot write {path}: parent directory {parent} does not exist"
         )
 
-    # Sweep temporary files a crashed writer left behind. This is a
-    # single-process tool, so there is no concurrent writer of this path to
-    # race with; a stale file can only be debris, never live work.
-    for stale in parent.glob(f".{path.name}.*"):
+    # Sweep temporary files a crashed writer left behind. The pattern ends in
+    # ``.tmp`` so it matches only this writer's own debris -- the ``mkstemp``
+    # names ``.{path.name}.<random>.tmp`` -- and never an unrelated file that
+    # merely shares the prefix, such as a manual ``.{path.name}.backup``. This
+    # is a single-process tool, so there is no concurrent writer of this path
+    # to race with; a stale matching file can only be debris, never live work.
+    for stale in parent.glob(f".{path.name}.*.tmp"):
         try:
             stale.unlink()
         except OSError:

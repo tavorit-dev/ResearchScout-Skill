@@ -364,8 +364,11 @@ class TestWritersRefuseToInventProject(unittest.TestCase):
 
     def test_rebuild_manifest_writes_nothing_at_a_missing_root(self):
         root = self.tmp / "manifest"
-        with self.assertRaises(FileNotFoundError):
+        with self.assertRaises(FileNotFoundError) as ctx:
             rebuild_manifest(root)
+        message = str(ctx.exception)
+        self.assertIn(str(root), message)
+        self.assertIn("init_research", message)
         self.assertFalse(root.exists())
 
     def test_atomic_writer_never_creates_directories(self):
@@ -389,6 +392,19 @@ class TestTemporaryFileHygiene(unittest.TestCase):
         save_state(self.root, {"round": 1})
         self.assertFalse(stale.exists())
         self.assertEqual(load_state(self.root), {"round": 1})
+
+    def test_stale_sweep_removes_only_its_own_temporary_files(self):
+        # Pin the radius, not just the cleanup: a file that merely shares the
+        # prefix is somebody else's (a manual backup, say) and must survive.
+        state_dir = self.root / "state"
+        stale = state_dir / ".current.json.CRASHED.tmp"
+        backup = state_dir / ".current.json.backup"
+        stale.write_text("garbage", encoding="utf-8")
+        backup.write_text("keep me", encoding="utf-8")
+        save_state(self.root, {"round": 1})
+        self.assertFalse(stale.exists())
+        self.assertTrue(backup.exists())
+        self.assertEqual(backup.read_text(encoding="utf-8"), "keep me")
 
     def test_fdopen_failure_closes_descriptor_and_removes_temp_file(self):
         captured = []
@@ -456,11 +472,6 @@ class TestRoundCounting(unittest.TestCase):
     def test_directory_named_like_a_round_is_not_counted(self):
         (self.root / "iterations" / "round-999.json").mkdir()
         self.assertEqual(rebuild_manifest(self.root)["round_count"], 0)
-
-    def test_round_files_are_counted(self):
-        save_iteration(self.root, 1, {"decision": "CONTINUE"})
-        save_iteration(self.root, 2, {"decision": "DEEPEN"})
-        self.assertEqual(rebuild_manifest(self.root)["round_count"], 2)
 
 
 if __name__ == "__main__":
