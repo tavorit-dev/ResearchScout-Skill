@@ -270,6 +270,103 @@ class TestTargetUrlIsEvaluated(unittest.TestCase):
         self.assertEqual(record["allowed_paths"], ["/feed"])
 
 
+class TestTargetPathIsNormalised(unittest.TestCase):
+    """The gate must evaluate the same path the collector enforces (fix round 5).
+
+    robots.txt is asked about ``/secret``; the collector compares normalised
+    paths. A gate that queries robots with the raw path while the collector
+    compares the normalised one lets ``/%73ecret`` and ``/public/../secret``
+    through: the gate sees a path robots never refused, records it, and the
+    collector's pre-fetch check then matches its own recorded value by
+    construction.
+    """
+
+    ROBOTS = "User-agent: *\nDisallow: /secret\n"
+
+    def _checked(self, target_url, robots=None):
+        fetcher = fake_fetcher({
+            "https://e.org": {"outcome": "ok", "status": 200},
+            "https://e.org/robots.txt": {
+                "outcome": "ok", "status": 200, "text": robots or self.ROBOTS,
+            },
+        })
+        return check_compliance(
+            {
+                "source_id": "src_1",
+                "base_url": "https://e.org",
+                "access_method": "rss",
+                "feed_url": target_url,
+            },
+            fetcher=fetcher,
+            target_url=target_url,
+        )
+
+    def test_the_plain_disallowed_target_is_blocked(self):
+        record = self._checked("https://e.org/secret/feed")
+        self.assertEqual(record["compliance_status"], "BLOCKED")
+        self.assertEqual(record["allowed_paths"], [])
+
+    def test_an_encoded_disallowed_target_is_blocked(self):
+        record = self._checked("https://e.org/%73ecret/feed")
+        self.assertEqual(record["compliance_status"], "BLOCKED")
+        self.assertEqual(record["allowed_paths"], [])
+
+    def test_a_dot_segment_target_that_resolves_into_the_disallowed_path_is_blocked(self):
+        record = self._checked("https://e.org/public/../secret/feed")
+        self.assertEqual(record["compliance_status"], "BLOCKED")
+        self.assertEqual(record["allowed_paths"], [])
+
+    def test_an_encoded_permitted_target_records_its_plain_path(self):
+        # The inverse direction: normalisation must not make everything fail.
+        # A permitted address stated in encoded form is still permitted, and
+        # the path recorded is the one the collector will compare against.
+        record = self._checked(
+            "https://e.org/%66eed", robots="User-agent: *\nAllow: /\n",
+        )
+        self.assertEqual(record["compliance_status"], "ALLOWED")
+        self.assertEqual(record["allowed_paths"], ["/feed"])
+
+
+class TestTargetOriginBoundToTheSource(unittest.TestCase):
+    """The gate must not grant a path for a target it never checked (fix round 5).
+
+    ``check_compliance`` consults robots.txt for the source's origin. A target
+    on another origin cannot be covered by that answer, so it is marked as a
+    misconfiguration and no path is recorded for it. The collector's own
+    off-host refusal remains the second line.
+    """
+
+    def test_an_off_origin_target_is_marked_misconfigured_without_a_path(self):
+        calls = []
+
+        def fetcher(url, **kwargs):
+            calls.append(url)
+            if url.endswith("/robots.txt"):
+                return {"outcome": "ok", "status": 200,
+                        "text": "User-agent: *\nAllow: /\n"}
+            return {"outcome": "ok", "status": 200}
+
+        record = check_compliance(
+            {
+                "source_id": "src_1",
+                "base_url": "https://e.org",
+                "access_method": "rss",
+                "feed_url": "https://evil.example/feed",
+            },
+            fetcher=fetcher,
+            target_url="https://evil.example/feed",
+        )
+
+        self.assertEqual(record["compliance_status"], "ERROR")
+        self.assertEqual(record["allowed_paths"], [])
+        # No decision marker: the next round must check this record again.
+        self.assertFalse(record.get("checked_at"))
+        # The off-origin target was never requested; only the source's own
+        # origin was consulted.
+        self.assertNotIn("https://evil.example/feed", calls)
+        self.assertIn("https://e.org/robots.txt", calls)
+
+
 class RecordingFetcher:
     """A fetcher that records the delay each request was issued with."""
 
