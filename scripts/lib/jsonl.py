@@ -5,6 +5,8 @@ appending is cheap and the file migrates across research projects (spec 9.4).
 """
 import csv
 import json
+import os
+import tempfile
 from pathlib import Path
 
 
@@ -39,6 +41,12 @@ def upsert_by_id(path, record, id_field):
 
     Returns "inserted" or "updated". An update keeps the record's original
     position in the file.
+
+    The rewritten file is written to a same-directory temporary file and moved
+    into place with ``os.replace``, matching the archive layer's atomicity: a
+    process killed mid-write leaves the previous file intact instead of a
+    truncated JSONL. The parent directory is still created when absent,
+    because this writer has always been usable for a first record.
     """
     path = Path(path)
     records = read_records(path)
@@ -53,9 +61,35 @@ def upsert_by_id(path, record, id_field):
         records.append(record)
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
-        for item in records:
-            fh.write(json.dumps(item, ensure_ascii=False) + "\n")
+    descriptor, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        try:
+            stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            # os.fdopen failed before the ``with`` block took ownership of the
+            # descriptor, so close it here or it leaks.
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        with stream:
+            for item in records:
+                line = json.dumps(item, ensure_ascii=False) + "\n"
+                stream.write(line)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        # Best effort: the original exception is what the caller needs, and a
+        # leftover temp file must not mask it.
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return status
 
 

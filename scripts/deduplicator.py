@@ -54,7 +54,7 @@ from scripts.lib.urlnorm import url_identity
 DEFAULT_SIMILARITY_THRESHOLD = 0.9
 
 
-def dedupe(documents):
+def dedupe(documents, texts=None):
     """Collapse the duplicate records in ``documents`` and report what went.
 
     Layers 1 and 2 remove records; layer 3 only reports. A document is dropped
@@ -63,6 +63,14 @@ def dedupe(documents):
     the input is in discovery order, so the first sighting of a document is
     the one kept, and the outcome does not depend on how the list happens to
     be ordered beyond that.
+
+    ``texts`` is an optional transient map from ``document_id`` to the body
+    text seen this round. Persisted document records carry no body, so without
+    it layer 3 has nothing to compare and never fires through the product
+    path. When an id is present in the map, that text is used for the
+    comparison; otherwise the document's own ``text`` field is used (the
+    pre-existing behaviour). The map is read and dropped -- it is never written
+    to a record, and layer 3 still only reports pairs.
 
     Returns ``(kept, report)``, where ``kept`` is the surviving documents in
     their original order and ``report`` holds:
@@ -118,13 +126,14 @@ def dedupe(documents):
         # Layer 3 reports and does not merge: the list is evidence for a
         # later judgement, never a reason to drop a document (spec 10.1).
         "semantic_candidates": find_semantic_candidates(
-            kept, DEFAULT_SIMILARITY_THRESHOLD
+            kept, DEFAULT_SIMILARITY_THRESHOLD, texts=texts
         ),
     }
     return kept, report
 
 
-def find_semantic_candidates(documents, threshold=DEFAULT_SIMILARITY_THRESHOLD):
+def find_semantic_candidates(documents, threshold=DEFAULT_SIMILARITY_THRESHOLD,
+                             texts=None):
     """Return the pairs of documents that look like near-duplicates.
 
     Similarity is character-level over the body text, via the standard
@@ -158,7 +167,7 @@ def find_semantic_candidates(documents, threshold=DEFAULT_SIMILARITY_THRESHOLD):
         if not isinstance(document, dict):
             continue
         identifier = _document_id(document)
-        text = _document_text(document)
+        text = _text_for(identifier, document, texts)
         if identifier and text:
             comparable.append((identifier, text))
 
@@ -216,6 +225,25 @@ def _document_text(document):
     if isinstance(value, str):
         return value
     return ""
+
+
+def _text_for(identifier, document, texts):
+    """Return the comparison text for one document.
+
+    The transient ``texts`` map wins when it names this document, because a
+    persisted record carries no body under reference retention. Otherwise the
+    record's own ``text`` field is used, which is what callers had before the
+    map existed. A non-string value in the map is treated as no text rather
+    than stringified: the comparison is character-level, and ``str(dict)``
+    would invent similarity between unrelated records.
+    """
+    if texts is not None:
+        getter = getattr(texts, "get", None)
+        if callable(getter):
+            value = getter(identifier)
+            if value is not None:
+                return value if isinstance(value, str) else ""
+    return _document_text(document)
 
 
 def _url_key(document):

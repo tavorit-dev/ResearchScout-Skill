@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from scripts.collector import (assert_compliance_allows, collect, parse_feed,
                                path_is_permitted)
+from scripts.lib.hashing import content_hash
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_feed.xml"
 
@@ -103,6 +104,20 @@ PLAIN_TITLE_FEED = """<?xml version="1.0" encoding="UTF-8"?>
 </rss>
 """
 
+# An entry whose only prose is inside <content>. In Atom that element often
+# carries the full article body, so it must never be stored as the summary.
+CONTENT_ONLY_FEED = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <item>
+      <title>Content Only Entry</title>
+      <link>https://e.org/a1</link>
+      <content>full article text that must not be stored</content>
+    </item>
+  </channel>
+</rss>
+"""
+
 
 def source(**overrides):
     """Return an ALLOWED rss source, with overrides applied."""
@@ -183,6 +198,20 @@ class TestMixedContentText(unittest.TestCase):
         self.assertEqual(parse_feed(feed)[0]["summary"], "Desc ription tail")
 
 
+class TestFeedContentIsNeverTheSummary(unittest.TestCase):
+    def test_content_only_entries_do_not_persist_the_article_body(self):
+        docs = collect(source(), fetcher=text_fetcher(CONTENT_ONLY_FEED))
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0]["summary"], "")
+        # The fingerprint must not be the article body either: that would make
+        # the stored hash a proxy for text the retention mode says is not kept.
+        self.assertNotEqual(
+            docs[0]["content_hash"],
+            content_hash("full article text that must not be stored"),
+        )
+        self.assertEqual(docs[0]["content_hash"], content_hash("Content Only Entry"))
+
+
 class TestRedirectIsRechecked(unittest.TestCase):
     def test_redirect_to_another_host_is_refused(self):
         docs = collect(
@@ -211,6 +240,29 @@ class TestRedirectIsRechecked(unittest.TestCase):
             fetcher=text_fetcher(ATOM_FEED, final_url="ftp://e.org/feed"),
         )
         self.assertEqual(docs, [])
+
+    def test_redirect_to_another_scheme_is_refused(self):
+        docs = collect(
+            source(),
+            fetcher=text_fetcher(ATOM_FEED, final_url="http://e.org/feed"),
+        )
+        self.assertEqual(docs, [])
+
+    def test_redirect_to_another_port_is_refused(self):
+        docs = collect(
+            source(),
+            fetcher=text_fetcher(ATOM_FEED,
+                                 final_url="https://e.org:8443/feed"),
+        )
+        self.assertEqual(docs, [])
+
+    def test_redirect_to_the_default_port_is_the_same_origin(self):
+        docs = collect(
+            source(),
+            fetcher=text_fetcher(ATOM_FEED,
+                                 final_url="https://e.org:443/feed"),
+        )
+        self.assertEqual(len(docs), 2)
 
 
 class TestSchemeAllowlist(unittest.TestCase):

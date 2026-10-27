@@ -16,8 +16,10 @@ Four invariants meet here for the first time.
 
 1. **Compliance before collection (invariant 1, V2).** For every verified
    source the round obtains a compliance decision first: it calls
-   ``compliance_gate.check_compliance`` when the source carries no
-   ``checked_at``, and honours the recorded decision when it does. Only
+   ``compliance_gate.check_compliance`` when the source carries no fresh
+   decision for that address (a decision older than
+   ``compliance_recheck_days`` and any ``REVIEW_REQUIRED`` record is made
+   again), and honours a live recorded decision when it has one. Only
    ``ALLOWED`` reaches ``collector.collect``, whose
    ``assert_compliance_allows`` remains the structural backstop. Nothing in
    this module collects without a decision, trusts a permission status that no
@@ -73,7 +75,7 @@ import platform
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -95,15 +97,16 @@ from scripts.archive import (DOCUMENTS_FILE, FINDINGS_FILE, ROUND_DIGITS,
 from scripts.collector import (collect, path_is_permitted,
                                target_url as collector_target_url)
 from scripts.compliance_gate import (STATUS_ALLOWED, STATUS_ERROR,
-                                     check_compliance)
+                                     STATUS_REVIEW_REQUIRED, check_compliance)
 from scripts.content_extractor import extract_content
 from scripts.deduplicator import dedupe
 from scripts.lib.config import DEFAULTS, load_config
 from scripts.lib.hashing import content_hash
 from scripts.lib.ids import new_id
 from scripts.lib.jsonl import read_records, upsert_by_id
+from scripts.lib.policy import load_policies
 from scripts.lib.sanitize import contains_injection_markers
-from scripts.lib.urlnorm import normalize_url
+from scripts.lib.urlnorm import normalize_url, same_origin
 from scripts.lib.validate import validate_record
 from scripts.planner import load_research
 from scripts.reflection import (FINDING_SCORE_FIELDS, compute_weight,
@@ -159,6 +162,11 @@ RETENTION_REFERENCE = "reference"
 # page this module ran through the extractor has reached EXTRACTED (spec 10.3).
 CRAWL_STATUS_EXTRACTED = "EXTRACTED"
 
+# How long a recorded compliance decision may be reused before the source is
+# re-checked (spec 6.6). ``config/default.yaml`` sets the same value; a caller
+# whose config omits the key gets this default rather than a permanent decision.
+DEFAULT_RECHECK_DAYS = 30
+
 # Two patterns that are, in practice, always worth telling the host about in a
 # readiness report. The project imports both modules itself, so a missing one
 # is a broken installation rather than a research condition.
@@ -188,7 +196,8 @@ def check_env(host_available=True):
     return True, ""
 
 
-def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
+def run_round(root, *, round_no, actions, config, fetcher=None, sources=None,
+              now=None):
     """Execute one round and return the structured handoff (spec 5.2, 5.6).
 
     The order is fixed:
@@ -282,6 +291,28 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
     The round is single-pass: it returns after step 6 and never schedules the
     next one. ``decision`` is the host's to make in ``apply_results``.
 
+    Proposed actions are schema-validated at the agent boundary before the
+    admission gate sees them (V12): an action that does not satisfy
+    ``action.schema.json`` is reported as ``invalid_action`` and the round
+    continues. ``seen_topics`` is seeded from the accepted topics recorded in
+    earlier iterations, so the duplicate check spans rounds rather than
+    restarting each round.
+
+    A recorded compliance decision is reused only while it is younger than
+    ``config["compliance_recheck_days"]`` (30 by default; a malformed or future
+    ``checked_at`` is stale). A source whose recorded status is
+    ``REVIEW_REQUIRED`` is always re-checked instead of reused: it has no
+    permission to inherit, and a user authorisation in
+    ``archive/registry/source_policies.jsonl`` can only take effect if the gate
+    runs again. ``now`` is injectable for tests and is also handed to the gate
+    so expiry and ``checked_at`` share one instant.
+
+    The user authorisation registry is read from the archive root recorded in
+    ``state/current.json``, falling back to the project's two parent
+    directories. A malformed registry does not crash the round: it is reported
+    in ``actions_rejected`` as ``kind: "policy"`` and no source is released by
+    policy, which is the fail-closed direction.
+
     Collection is skipped when actions were proposed and *none* were admitted:
     a round whose every action was refused has nothing to collect. A round with
     no proposed actions may still collect from already-selected sources, which
@@ -313,6 +344,9 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
     actions = list(actions or [])
 
     state = _load_state_or_empty(root)
+    decision_now = _as_utc_datetime(now)
+    policies, policy_error = _load_policies(root, state)
+    recheck_days = _recheck_days(effective_config)
     requests_used = _usable_count(state.get("requests_used"))
 
     # A completed round is recorded by ``apply_results``. Replaying it -- or
@@ -340,7 +374,9 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
 
     accepted_actions = []
     rejected_actions = []
-    seen_topics = []
+    # Cross-round duplicate detection: a topic admitted in an earlier round is
+    # already under research, so proposing it again is duplicate work.
+    seen_topics = _prior_accepted_topics(root) if actions else []
     if actions:
         # Lazy by design: no actions, no scope, no research.yaml requirement.
         research = _load_research(root)
@@ -361,6 +397,25 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
                         "reason": (
                             "action must be a JSON object; a non-mapping value "
                             "cannot be evaluated against the scope"
+                        ),
+                        "scope_list": None,
+                    },
+                    "scope_list": None,
+                })
+                continue
+            # The action list crosses the agent boundary, so every record is
+            # schema-checked before the admission gate sees it (V12). A record
+            # that cannot be an action is reported, not crashed on.
+            schema_error = _action_schema_error(action)
+            if schema_error is not None:
+                rejected_actions.append({
+                    "action": action,
+                    "verdict": {
+                        "accepted": False,
+                        "rejected_as": REJECT_INVALID_ACTION,
+                        "reason": (
+                            "action failed action.schema.json validation: "
+                            f"{schema_error}"
                         ),
                         "scope_list": None,
                     },
@@ -398,6 +453,8 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
 
     actions_rejected = [_action_rejection(item) for item in rejected_actions]
     actions_rejected.extend(source_rejections)
+    if policy_error is not None:
+        actions_rejected.append({"kind": "policy", "reason": policy_error})
     if rounds_exceeded:
         actions_rejected.append({
             "kind": "round",
@@ -424,6 +481,9 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
     # round. It is neither a document field nor a persisted record, and only
     # ids that survive deduplication reach the handoff.
     text_by_id = {}
+    # Semantic near-duplicate pairs reported by the transient-text layer. They
+    # are report-only: nothing is removed on this ground (spec 10.1).
+    semantic_candidates = []
     try:
         if can_collect and not budget_exhausted:
             # The wrapper is the only place that knows how many transports
@@ -455,9 +515,20 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
                 # ``ALLOWED`` without ``checked_at`` is a claim the round must
                 # not trust, so it is re-checked like any other unchecked
                 # source.
-                if _decision_applies(
-                    source, archived_sources.get(source.get("source_id"))
-                ):
+                # A REVIEW_REQUIRED record is not a decision that may be
+                # inherited: re-check it so a user authorisation can take
+                # effect and so an unresolved source is never treated as a
+                # cached refusal forever.
+                reuse = (
+                    source.get("compliance_status") != STATUS_REVIEW_REQUIRED
+                    and _decision_applies(
+                        source,
+                        archived_sources.get(source.get("source_id")),
+                        now=decision_now,
+                        recheck_days=recheck_days,
+                    )
+                )
+                if reuse:
                     merged = dict(source)
                 else:
                     # A recorded robots URL for another host is as stale as
@@ -475,6 +546,8 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
                             # (fix 4, NEW-7). One helper keeps the two
                             # modules from disagreeing about the target.
                             target_url=collector_target_url(check_source),
+                            policies=policies,
+                            now=decision_now,
                         )
                     except _BudgetExhausted:
                         # The fetch that would have exceeded the budget did not
@@ -592,7 +665,13 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
                 # a budget that exists to bound new material (fix 4, NEW-2).
                 # ``collected`` holds only genuinely new records from here on.
                 already = existing_records + collected
-                kept, _dedupe_report = dedupe(already + valid_documents)
+                kept, dedupe_report = dedupe(
+                    already + valid_documents, texts=text_by_id
+                )
+                _extend_pairs(
+                    semantic_candidates,
+                    dedupe_report.get("semantic_candidates"),
+                )
                 already_ids = {id(record) for record in already}
                 fresh = [document for document in kept
                          if id(document) not in already_ids]
@@ -623,7 +702,10 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
         # original ``document_id`` and is not archived a second time. Only
         # genuinely new records are written and reported (spec 10.1).
         existing_objects = {id(record) for record in existing_records}
-        kept, _report = dedupe(existing_records + collected)
+        kept, report = dedupe(existing_records + collected, texts=text_by_id)
+        _extend_pairs(
+            semantic_candidates, report.get("semantic_candidates")
+        )
         new_documents = [document for document in kept
                          if id(document) not in existing_objects]
         if new_documents:
@@ -689,6 +771,8 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
             "rounds_remaining": max(0, policy["max_rounds"] - round_no),
         },
         "actions_rejected": actions_rejected,
+        "actions_accepted": accepted_actions,
+        "semantic_candidates": semantic_candidates,
         "budget_exhausted": budget_exhausted,
     }
 
@@ -727,6 +811,16 @@ def apply_results(root, *, handoff, observations, findings, next_actions, decisi
           concatenation of past rounds (spec 7.2);
        e. ``index/manifest.json`` last, because it counts what was just
           written.
+
+    ``next_actions`` are validated as action records too (V12). An invalid
+    entry is reported in the iteration's ``rejected_next_actions`` and skipped,
+    while the valid entries are the ones recorded for the next round.
+
+    The iteration record also carries the round's durable research state: the
+    accepted actions, the full rejection list (including candidate topics from
+    the scope gate) and the semantic near-duplicate pairs the round reported.
+    ``state/pending_actions.json`` is overwritten each round, so the iteration
+    file is where a refused candidate topic survives.
 
     All validation happens before the first write, so a rejected backfill
     leaves the archive untouched; each individual write is atomic.
@@ -780,6 +874,9 @@ def apply_results(root, *, handoff, observations, findings, next_actions, decisi
     if not isinstance(gaps, list):
         gaps = []
     next_actions = list(next_actions or [])
+    valid_next_actions, rejected_next_actions = _validated_next_actions(
+        next_actions
+    )
     weights = load_config()["finding_weights"]
 
     existing = read_records(Path(root) / FINDINGS_FILE)
@@ -804,7 +901,13 @@ def apply_results(root, *, handoff, observations, findings, next_actions, decisi
         "findings_conflicting": _finding_ids(merged["conflicting"]),
         "rejected_findings": rejected_findings,
         "skipped_findings": skipped_findings,
-        "next_actions": next_actions,
+        "next_actions": valid_next_actions,
+        "rejected_next_actions": rejected_next_actions,
+        "actions_accepted": _handoff_list(handoff.get("actions_accepted")),
+        "actions_rejected": _handoff_list(handoff.get("actions_rejected")),
+        "semantic_candidates": _handoff_list(
+            handoff.get("semantic_candidates")
+        ),
         "handoff": {
             "round": round_no,
             "new_documents": _list_length(handoff.get("new_documents")),
@@ -837,6 +940,7 @@ def apply_results(root, *, handoff, observations, findings, next_actions, decisi
         "findings_conflicting": _finding_ids(merged["conflicting"]),
         "rejected_findings": rejected_findings,
         "skipped_findings": skipped_findings,
+        "rejected_next_actions": rejected_next_actions,
         "findings_total": len(merged["findings"]),
         "iteration_path": str(Path(root) / "iterations" / _iteration_name(round_no)),
     }
@@ -1112,7 +1216,7 @@ def _target_matches(source, recorded):
         return False
 
 
-def _decision_applies(source, recorded=None):
+def _decision_applies(source, recorded=None, *, now=None, recheck_days=None):
     """Return True when a recorded decision was made for this address.
 
     ``check_compliance`` records ``domain`` and ``checked_at``, and now also
@@ -1123,7 +1227,10 @@ def _decision_applies(source, recorded=None):
 
     A decision is therefore reused only when all of the following hold:
 
-    * ``checked_at`` is present;
+    * ``checked_at`` is present, readable, not in the future, and no more than
+      ``recheck_days`` old (30 by default). Compliance results expire (spec
+      6.6): a malformed or undatable timestamp is stale, because a permission
+      whose age cannot be established must not be inherited;
     * the recorded ``domain`` is a non-empty string equal to the current base
       URL's host (the host check this function has always performed);
     * the recorded address is present and equal to the current ``base_url``
@@ -1148,7 +1255,13 @@ def _decision_applies(source, recorded=None):
     source re-pointed at a new address pays for a check it may not have
     needed, rather than inheriting consent it never received.
     """
-    if not source.get("checked_at"):
+    if not _checked_at_is_fresh(
+        source.get("checked_at"),
+        now=now,
+        recheck_days=(
+            DEFAULT_RECHECK_DAYS if recheck_days is None else recheck_days
+        ),
+    ):
         return False
     recorded_domain = source.get("domain")
     if not isinstance(recorded_domain, str) or not recorded_domain.strip():
@@ -1186,30 +1299,6 @@ def _decision_applies(source, recorded=None):
         return False
 
 
-def _origin_of(url):
-    """Return ``(scheme, host, port)`` for url, or None when unreadable."""
-    if not isinstance(url, str) or not url:
-        return None
-    try:
-        parts = urlsplit(url)
-        port = parts.port
-    except (TypeError, ValueError):
-        return None
-    scheme = (parts.scheme or "").lower()
-    host = (parts.hostname or "").lower()
-    if not scheme or not host:
-        return None
-    if port is None:
-        port = {"http": 80, "https": 443}.get(scheme)
-    return scheme, host, port
-
-
-def _same_origin(left, right):
-    """Return True when both URLs name the same scheme, host and port."""
-    left_origin = _origin_of(left)
-    return left_origin is not None and left_origin == _origin_of(right)
-
-
 def _drop_offhost_robots_url(source):
     """Return ``source`` without a ``robots_url`` from another origin.
 
@@ -1223,7 +1312,7 @@ def _drop_offhost_robots_url(source):
     legitimate override.
     """
     declared = source.get("robots_url")
-    if not declared or _same_origin(declared, source.get("base_url")):
+    if not declared or same_origin(declared, source.get("base_url")):
         return source
     return {key: value for key, value in source.items() if key != "robots_url"}
 
@@ -1398,7 +1487,7 @@ def _page_document(source, response, config):
 
     target = source.get("base_url") or ""
     final_url = response.get("final_url") or target
-    if not _same_host(target, final_url) or not _is_http(final_url):
+    if not same_origin(target, final_url) or not _is_http(final_url):
         return None, None
     if not path_is_permitted(source, final_url):
         return None, None
@@ -1465,18 +1554,150 @@ def _host_of(url):
         return ""
 
 
-def _same_host(left, right):
-    """Return True when both URLs name the same non-empty host."""
-    left_host = _host_of(left)
-    return bool(left_host) and left_host == _host_of(right)
-
-
 def _is_http(url):
     """Return True when ``url`` uses a scheme this project may fetch."""
     try:
         return urlsplit(url or "").scheme.lower() in ("http", "https")
     except ValueError:
         return False
+
+
+# -- round state helpers ----------------------------------------------------
+
+
+def _as_utc_datetime(value):
+    """Return ``value`` as a timezone-aware UTC datetime, else the clock."""
+    clock = value if isinstance(value, datetime) else datetime.now(timezone.utc)
+    if clock.tzinfo is None:
+        return clock.replace(tzinfo=timezone.utc)
+    return clock.astimezone(timezone.utc)
+
+
+def _recheck_days(config):
+    """Return the compliance re-check interval, defaulting to 30 days."""
+    sources = [config] if isinstance(config, dict) else []
+    policy = config.get("iteration_policy") if isinstance(config, dict) else None
+    if isinstance(policy, dict):
+        sources.append(policy)
+    for source in sources:
+        value = source.get("compliance_recheck_days")
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and value > 0):
+            return value
+    return DEFAULT_RECHECK_DAYS
+
+
+def _checked_at_is_fresh(checked_at, *, now, recheck_days):
+    """Return True when a decision timestamp is readable and recent enough.
+
+    A malformed, absent or future timestamp is stale, so the source is
+    re-checked. Re-checking costs a request; inheriting a permission whose age
+    cannot be established costs the compliance guarantee.
+    """
+    if not isinstance(checked_at, str) or not checked_at.strip():
+        return False
+    text = checked_at.strip()
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    clock = _as_utc_datetime(now)
+    if parsed > clock:
+        return False
+    return (clock - parsed) <= timedelta(days=recheck_days)
+
+
+def _archive_root_for(root, state):
+    """Return the archive root recorded in state, else the project's parents."""
+    value = state.get("archive_root") if isinstance(state, dict) else None
+    if isinstance(value, str) and value.strip():
+        return Path(value)
+    return Path(root).parent.parent
+
+
+def _load_policies(root, state):
+    """Return ``(policies, error)`` for the archive's authorisation registry.
+
+    A malformed registry is not a reason to lose a round, and it is never a
+    reason to widen permission: the round proceeds with no policies, so every
+    ``REVIEW_REQUIRED`` source stays parked, and the error is reported in the
+    handoff as a ``kind: "policy"`` rejection.
+    """
+    try:
+        return load_policies(_archive_root_for(root, state)), None
+    except (OSError, ValueError) as exc:
+        return [], (
+            f"policy registry could not be read ({exc}); no source is "
+            f"released by a user authorisation this round"
+        )
+
+
+def _prior_accepted_topics(root):
+    """Return the topics accepted by earlier rounds' iteration records.
+
+    ``state/pending_actions.json`` describes only the latest round, so the
+    iteration files are the durable record. A malformed file is skipped: one
+    unreadable history entry must not make the current round impossible.
+    """
+    directory = Path(root) / "iterations"
+    if not directory.is_dir():
+        return []
+    topics = []
+    for path in sorted(directory.glob("round-*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        accepted = (
+            record.get("actions_accepted") if isinstance(record, dict) else None
+        )
+        if not isinstance(accepted, list):
+            continue
+        for action in accepted:
+            topic = action.get("topic") if isinstance(action, dict) else None
+            if isinstance(topic, str) and topic.strip():
+                topics.append(topic.strip())
+    return topics
+
+
+def _action_schema_error(action):
+    """Return the action.schema.json error for a record, or None when valid."""
+    if not isinstance(action, dict):
+        return "action must be a JSON object"
+    try:
+        validate_record("action", action)
+    except ValidationError as exc:
+        return _validation_error_message(exc)
+    return None
+
+
+def _validated_next_actions(next_actions):
+    """Return ``(valid, rejected)`` for the agent's proposed next actions."""
+    valid, rejected = [], []
+    for record in next_actions:
+        error = _action_schema_error(record)
+        if error is not None:
+            rejected.append({"record": record, "error": error})
+            continue
+        valid.append(record)
+    return valid, rejected
+
+
+def _extend_pairs(target, pairs):
+    """Append semantic candidate pairs not already reported, in order."""
+    if not isinstance(pairs, list):
+        return
+    for pair in pairs:
+        if pair not in target:
+            target.append(pair)
+
+
+def _handoff_list(value):
+    """Return a list from a handoff field, or ``[]`` when it is not a list."""
+    return list(value) if isinstance(value, list) else []
 
 
 def _action_rejection(entry):
@@ -1670,6 +1891,10 @@ def _build_parser():
         help="检查运行环境并退出（不写任何文件）",
     )
     parser.add_argument(
+        "--no-host", dest="no_host", action="store_true",
+        help="与 --check-env 一起使用：报告当前没有 LLM 宿主并以非零状态退出",
+    )
+    parser.add_argument(
         "--root", metavar="<项目根>", help="研究项目根目录（archive/<领域>/<主题>）",
     )
     parser.add_argument(
@@ -1692,13 +1917,16 @@ def _build_parser():
 
 
 def _dispatch(parser, args):
+    if args.no_host and not args.check_env:
+        parser.error("--no-host 只能与 --check-env 一起使用")
+
     if args.check_env:
         if (args.root or args.round_no is not None or args.actions
                 or args.sources or args.apply_path):
             parser.error(
                 "--check-env 不能与 --root/--round/--actions/--sources/--apply 同时使用"
             )
-        return _run_check_env()
+        return _run_check_env(host_available=not args.no_host)
 
     if args.apply_path:
         if args.round_no is not None or args.actions or args.sources:
@@ -1724,8 +1952,13 @@ def _dispatch(parser, args):
     parser.error("必须指定 --check-env、--round 或 --apply 之一")
 
 
-def _run_check_env():
-    """Print the readiness report. Writes no file (V11)."""
+def _run_check_env(host_available=True):
+    """Print the readiness report. Writes no file (V11).
+
+    ``host_available`` comes from the command line (``--no-host``) because a
+    script cannot detect whether a model is driving it. With no host the report
+    says so and exits non-zero, which is the contract V11 asks for.
+    """
     lines = ["Research Scout 就绪检查", f"Python: {platform.python_version()}"]
     missing = []
     for name in REQUIRED_DEPENDENCIES:
@@ -1737,7 +1970,7 @@ def _run_check_env():
         else:
             lines.append(f"依赖 {name}: OK")
 
-    ok, message = check_env(host_available=True)
+    ok, message = check_env(host_available=host_available)
     lines.append(f"宿主: {HOST_NOTE}")
     lines.append("状态: 就绪" if ok and not missing else f"状态: {message or '依赖缺失'}")
     print("\n".join(lines))
