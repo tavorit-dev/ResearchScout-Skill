@@ -82,6 +82,12 @@ LIST_CORE = "core"
 LIST_RELATED = "related"
 LIST_EXCLUDED = "excluded"
 
+# The remaining ``scope_list_of`` answers. ``LIST_NONE`` means the topic is in
+# no declared list; ``LIST_UNCONFIRMED`` means the scope has no authority to
+# say, so no membership question was asked at all.
+LIST_NONE = "none"
+LIST_UNCONFIRMED = "unconfirmed"
+
 # The one action type whose default time window is unlimited, because finding
 # original evidence sometimes means reaching far back (spec 7.5).
 UNLIMITED_WINDOW_TYPES = frozenset(
@@ -139,14 +145,19 @@ def check_scope(action, scope):
         )
 
     topic = _topic_of(action)
-    if _contains(scope.get(LIST_EXCLUDED), topic):
+    # Membership lives in ``scope_list_of`` so the formal check and the
+    # machine-readable verdict can never disagree about which list a topic is
+    # in. The order the function reports (excluded, core, related) is the
+    # precedence check_scope applies.
+    membership = scope_list_of(action, scope)
+    if membership == LIST_EXCLUDED:
         return False, (
             f"topic {topic!r} is in the excluded scope: rejected and recorded "
             f"as a separate candidate research topic"
         )
-    if _contains(scope.get(LIST_CORE), topic):
+    if membership == LIST_CORE:
         return True, f"topic {topic!r} is in the core scope"
-    if _contains(scope.get(LIST_RELATED), topic):
+    if membership == LIST_RELATED:
         if not _has_justification(action.get("scope_justification")):
             return False, (
                 f"topic {topic!r} is in the related scope but carries no "
@@ -160,14 +171,72 @@ def check_scope(action, scope):
     )
 
 
+def scope_list_of(action, scope):
+    """Return which scope list decides a topic: core/related/excluded/none.
+
+    This is the machine-readable half of spec 7.8's scope verdict. The gate's
+    ``rejected_as`` label deliberately collapses three outcomes into
+    ``candidate_topic`` -- an ``excluded`` topic, a topic in no list at all,
+    and a ``related`` topic missing its justification. The spec does not treat
+    the third as the same thing: ``excluded`` and out-of-scope topics become
+    candidate research *topics*, while a ``related`` topic without a
+    justification is downgraded to a candidate *lead* and stays inside the
+    current research. A caller that could only switch on the English sentence
+    in ``reason`` would be parsing prose, not using an interface, and a copy
+    edit would silently reroute candidate leads into the wrong file.
+
+    The answers are:
+
+    * ``"unconfirmed"`` -- ``scope["confirmed"] is not True``. No membership
+      question was asked, because an unconfirmed scope has no authority to
+      answer one (the same strict-identity rule as ``check_scope``).
+    * ``"excluded"`` -- a deliberate exclusion, which wins over any other list
+      membership: a topic that is both core and excluded stays excluded, or
+      editing the core list would silently reopen a topic the user ruled out.
+    * ``"core"`` -- inside the declared core list; ``core`` wins over
+      ``related``.
+    * ``"related"`` -- inside the declared related list. Whether the action
+      actually carries the justification it needs is a separate formal check
+      (``check_scope``); this function only reports where the topic sits.
+    * ``"none"`` -- in no list; recorded as a separate candidate research
+      topic.
+
+    Matching reuses ``_contains``: exact equality after stripping surrounding
+    whitespace from the action's topic. A near-miss is ``"none"``, never a
+    guess at the intended list.
+
+    Raises
+    ------
+    AttributeError
+        When ``scope`` is not a mapping (for the same reason as
+        ``check_scope``), or when ``action`` is not a mapping while the scope
+        *is* confirmed. An unconfirmed scope short-circuits before the action
+        is read, so the documented ``evaluate_action(None, scope=unconfirmed)``
+        path still returns a normal rejection rather than raising.
+    """
+    if scope.get("confirmed") is not True:
+        return LIST_UNCONFIRMED
+    topic = _topic_of(action)
+    if _contains(scope.get(LIST_EXCLUDED), topic):
+        return LIST_EXCLUDED
+    if _contains(scope.get(LIST_CORE), topic):
+        return LIST_CORE
+    if _contains(scope.get(LIST_RELATED), topic):
+        return LIST_RELATED
+    return LIST_NONE
+
+
 def evaluate_action(action, *, scope, budget, seen_topics, min_priority=None):
     """Return the admission verdict for one candidate action.
 
-    The verdict is ``{"accepted": bool, "reason": str, "rejected_as": str | None}``.
-    ``reason`` is always a readable sentence and is never blank, including on
-    success; ``rejected_as`` is ``None`` exactly when ``accepted`` is True.
-    On failure it is one of the labels documented in the module docstring, and
-    the first failing check in that documented order wins.
+    The verdict is ``{"accepted": bool, "reason": str, "rejected_as": str | None,
+    "scope_list": str}``. ``reason`` is always a readable sentence and is never
+    blank, including on success; ``rejected_as`` is ``None`` exactly when
+    ``accepted`` is True. On failure it is one of the labels documented in the
+    module docstring, and the first failing check in that documented order
+    wins. ``scope_list`` is ``scope_list_of(action, scope)`` and is present on
+    every verdict, admitted or refused, so a caller never has to parse
+    ``reason`` to tell a candidate lead from a candidate research topic.
 
     ``check_scope`` runs first, so a scope that is not confirmed refuses
     everything. Then:
@@ -207,6 +276,10 @@ def evaluate_action(action, *, scope, budget, seen_topics, min_priority=None):
         exception is only ever raised once the scope has been accepted.
     """
     accepted, reason = check_scope(action, scope)
+    # Safe to read now: check_scope has already refused or raised on an
+    # unusable scope, and an unconfirmed scope short-circuits before the
+    # action is touched, preserving the documented non-mapping-action path.
+    scope_list = scope_list_of(action, scope)
     if not accepted:
         # Deliberate recheck of the confirmation flag, not redundant
         # bookkeeping: ``check_scope`` returns only a reason, so the label has
@@ -224,13 +297,14 @@ def evaluate_action(action, *, scope, budget, seen_topics, min_priority=None):
             if scope.get("confirmed") is not True
             else REJECT_CANDIDATE_TOPIC
         )
-        return _rejected(reason, rejected_as)
+        return _rejected(reason, rejected_as, scope_list)
 
     if not _has_budget(budget):
         return _rejected(
             "the document budget for this research is exhausted, so no further "
             "action can be admitted",
             REJECT_BUDGET,
+            scope_list,
         )
 
     topic = _topic_of(action)
@@ -239,6 +313,7 @@ def evaluate_action(action, *, scope, budget, seen_topics, min_priority=None):
             f"topic {topic!r} has already been researched, so this action "
             f"duplicates existing work",
             REJECT_DUPLICATE,
+            scope_list,
         )
 
     if not _meets_priority(action.get("priority"), min_priority):
@@ -247,22 +322,29 @@ def evaluate_action(action, *, scope, budget, seen_topics, min_priority=None):
             f"priority {action.get('priority')!r} is below the admission floor "
             f"of {floor}",
             REJECT_LOW_PRIORITY,
+            scope_list,
         )
 
     ok, window_reason = _has_time_window(action)
     if not ok:
-        return _rejected(window_reason, REJECT_MISSING_TIME_WINDOW)
+        return _rejected(window_reason, REJECT_MISSING_TIME_WINDOW, scope_list)
 
     return {
         "accepted": True,
         "reason": f"action {action.get('action_id')!r} admitted: {reason}",
         "rejected_as": None,
+        "scope_list": scope_list,
     }
 
 
-def _rejected(reason, rejected_as):
-    """Return a rejection verdict with its label and a readable reason."""
-    return {"accepted": False, "reason": reason, "rejected_as": rejected_as}
+def _rejected(reason, rejected_as, scope_list):
+    """Return a rejection verdict with its label, reason and scope list."""
+    return {
+        "accepted": False,
+        "reason": reason,
+        "rejected_as": rejected_as,
+        "scope_list": scope_list,
+    }
 
 
 def _topic_of(action):
