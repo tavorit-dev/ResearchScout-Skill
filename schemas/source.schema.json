@@ -71,7 +71,7 @@
         "ERROR",
         "UNREACHABLE"
       ],
-      "description": "Outcome of the compliance gate. BLOCKED means policy forbids collection; ERROR means the check failed; UNREACHABLE means robots.txt could not be read, which pauses the source rather than allowing it."
+      "description": "Outcome of the compliance gate. BLOCKED means policy forbids collection; ERROR means the check failed, including a robots.txt that could not be read; UNREACHABLE means the source's base URL did not answer the reachability request, which pauses the source rather than allowing it."
     },
     "allowed_paths": {
       "type": "array",

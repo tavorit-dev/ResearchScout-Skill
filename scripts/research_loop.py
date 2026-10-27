@@ -413,6 +413,10 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
             archived_sources[record["source_id"]] = record
 
     can_collect = (not actions) or bool(accepted_actions)
+    # Transient analysis material for the host: document_id -> text seen this
+    # round. It is neither a document field nor a persisted record, and only
+    # ids that survive deduplication reach the handoff.
+    text_by_id = {}
     try:
         if can_collect and not budget_exhausted:
             # The wrapper is the only place that knows how many transports
@@ -547,10 +551,24 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
                     requests_used += recorder.invocations - before
 
                 candidates = list(documents)
+                # A feed entry carries the summary its feed published; that is
+                # the only text the host can analyse for this document.
+                for document in documents:
+                    if not isinstance(document, dict):
+                        continue
+                    summary = document.get("summary")
+                    document_id = document.get("document_id")
+                    if (isinstance(summary, str) and summary.strip()
+                            and isinstance(document_id, str) and document_id):
+                        text_by_id[document_id] = summary
                 if not documents and not budget_exhausted:
-                    page = _page_document(merged, recorder.last, effective_config)
+                    page, page_text = _page_document(
+                        merged, recorder.last, effective_config
+                    )
                     if page is not None:
                         candidates.append(page)
+                        if isinstance(page_text, str) and page_text.strip():
+                            text_by_id[page["document_id"]] = page_text
 
                 # One malformed document must not discard the round's other
                 # work. The archive layer still validates before writing; this
@@ -621,9 +639,20 @@ def run_round(root, *, round_no, actions, config, fetcher=None, sources=None):
         budget_exhausted = True
 
     current_findings = read_records(root / FINDINGS_FILE)
+    # Only this round's genuinely new documents get text, in their handoff
+    # order. A deduplicated document was already reported in the round that
+    # archived it, and its body must not be handed back a second time.
+    document_texts = {}
+    for document in new_documents:
+        if not isinstance(document, dict):
+            continue
+        document_id = document.get("document_id")
+        if isinstance(document_id, str) and document_id in text_by_id:
+            document_texts[document_id] = text_by_id[document_id]
     return {
         "round": round_no,
         "new_documents": new_documents,
+        "document_texts": document_texts,
         "candidates_for_review": review_sources,
         "state_summary": summarize_state(current_findings, [], []),
         "remaining_budget": {
@@ -1318,7 +1347,7 @@ def _default_fetcher(url, *, timeout, max_bytes, delay):
 
 
 def _page_document(source, response, config):
-    """Return one document extracted from an HTML page source, or ``None``.
+    """Return ``(document, body)`` for an HTML page source, or ``(None, None)``.
 
     A web source is not a feed, so ``collect`` parses no entries from it. This
     path runs the same rules the collector does before archiving what the page
@@ -1338,35 +1367,41 @@ def _page_document(source, response, config):
     only the metadata the page stated, a reference and a fingerprint are
     kept. The fingerprint comes from the extracted text, so the second
     deduplication layer sees what the reader would (spec 9.6, 10.1).
+
+    ``body`` is returned separately so the round can hand the extracted text to
+    the host for this round only. It is not a document field and is never
+    written to the archive: a record is metadata, while the text is the
+    transient material the host analyses and then drops (or quotes within the
+    permitted excerpt).
     """
     if not isinstance(response, dict) or response.get("outcome") != "ok":
-        return None
+        return None, None
     if (source.get("access_method") or "").strip().lower() in FEED_METHODS:
-        return None
+        return None, None
 
     target = source.get("base_url") or ""
     final_url = response.get("final_url") or target
     if not _same_host(target, final_url) or not _is_http(final_url):
-        return None
+        return None, None
     if not path_is_permitted(source, final_url):
-        return None
+        return None, None
 
     text = response.get("text")
     if not isinstance(text, str) or not text.strip():
-        return None
+        return None, None
     if not _looks_like_html(text):
-        return None
+        return None, None
     extracted = extract_content(text, final_url)
     body = extracted.get("text") or ""
     if not isinstance(body, str) or not body.strip():
-        return None
+        return None, None
 
     try:
         canonical_url = normalize_url(final_url)
     except ValueError:
         # A malformed address that survived the host/scheme check (a bad port,
         # for example) cannot be a document's identity.
-        return None
+        return None, None
 
     retrieved_at = _utc_now()
     record = {
@@ -1390,7 +1425,7 @@ def _page_document(source, response, config):
     author = extracted.get("author")
     if isinstance(author, str) and author.strip():
         record["author"] = author
-    return record
+    return record, body
 
 
 def _looks_like_html(text):
