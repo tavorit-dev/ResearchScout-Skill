@@ -52,6 +52,14 @@ class TestSkillContract(unittest.TestCase):
         head = self.text[:2000]
         self.assertTrue(head.isascii(), "SKILL.md must be English")
 
+    def test_documents_the_no_host_check(self):
+        self.assertIn("--no-host", self.text)
+
+    def test_documents_the_user_authorisation_path(self):
+        self.assertIn("save_policy", self.text)
+        self.assertIn("source_policies.jsonl", self.text)
+        self.assertIn("REVIEW_REQUIRED", self.text)
+
     def test_documented_script_paths_exist(self):
         """Every scripts/<name>.py named in SKILL.md is a real module."""
         documented = set(SCRIPT_PATH.findall(self.text))

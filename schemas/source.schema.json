@@ -92,7 +92,7 @@
     },
     "last_checked_at": {
       "type": ["string", "null"],
-      "description": "Timestamp of the last compliance check, ISO 8601."
+      "description": "Timestamp of the last compliance check, ISO 8601. The v1 gate does not write this field; checked_at records when the decision was assembled."
     },
     "selection_status": {
       "type": "string",
@@ -109,7 +109,7 @@
     },
     "robots_status": {
       "type": "string",
-      "description": "Robots outcome, for example ok, absent, blocked or error."
+      "description": "Robots outcome as the gate emits it: allowed, absent, blocked, error or not_checked. It mirrors robots.txt evaluation, not an HTTP status code."
     },
     "terms_status": {
       "type": "string",

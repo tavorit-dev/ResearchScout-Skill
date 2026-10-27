@@ -30,7 +30,10 @@ belong to the host.
 - Run every command from the Skill root.
 - After installing the dependencies, confirm readiness with
   `python3 scripts/research_loop.py --check-env`. It prints the Python version
-  and dependency status and writes no files.
+  and dependency status and writes no files. In a hostless environment use
+  `python3 scripts/research_loop.py --check-env --no-host`: the report states
+  that the Skill cannot run on its own and exits non-zero, still writing
+  nothing.
 
 ## Installation
 
@@ -165,22 +168,35 @@ candidates = json.loads(Path("candidates.json").read_text(encoding="utf-8"))
 confirmed = set(json.loads(
     Path("confirmed-sources.json").read_text(encoding="utf-8")
 ))
-kept, unreachable = [], []
+kept, unreachable, blocked = [], [], []
 for candidate in candidates:
     if candidate.get("source_id") not in confirmed:
         # An unconfirmed candidate is never probed, verified or collected.
         continue
-    if check_reachability(candidate) == "REACHABLE":
+    answer = check_reachability(candidate)
+    if answer == "REACHABLE":
         candidate["discovery_verified"] = True
         kept.append(candidate)
+    elif answer == "BLOCKED":
+        # 401/403 or another 4xx: the server refused the request.
+        blocked.append(candidate.get("source_id"))
     else:
+        # Timeout, network failure or 5xx: the address did not answer.
         unreachable.append(candidate.get("source_id"))
 Path("sources.json").write_text(
     json.dumps(kept, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
 )
+print("blocked confirmed sources:", blocked)
 print("unreachable confirmed sources:", unreachable)
 PY
 ```
+
+Reachability only says whether the address answers; it is not a permission
+decision. A refusal (401/403/4xx) is `BLOCKED`; a timeout or 5xx is
+`UNREACHABLE`; neither is permission. The round's gate still decides every
+`REVIEW_REQUIRED` source in `sources.json`; after an explicit user
+authorisation, record it with the scoped, expiring policy shown in "Compliance
+Statement".
 
 5. Run the round. The compliance gate runs inside the round; the host never
    marks a source `ALLOWED` itself:
@@ -252,8 +268,10 @@ is no need to wait for the whole research to finish.
 - **Round handoff**: `new_documents` (metadata only), `document_texts` (the new
   documents' body or summary, for this round's analysis only, never persisted),
   `document_warnings` (prompt-injection phrases found in the text, advisory
-  only), `state_summary`, `remaining_budget`, `actions_rejected` and
-  `budget_exhausted`.
+  only), `state_summary`, `remaining_budget`, `actions_rejected`,
+  `actions_accepted`, `semantic_candidates` and `budget_exhausted`. Semantic
+  near-duplicate pairs are reported only; no document is removed on that
+  ground.
 - **Archive contents**: metadata and a content fingerprint only
   (`retention_mode: "reference"`); the full text is not stored.
 - **Injection warnings are only a hint**: a hit means the text contains a
@@ -271,9 +289,19 @@ is no need to wait for the whole research to finish.
   finding. `ALLOWED` only means the checks this tool performs found nothing
   prohibiting collection; it is not authorisation, a licence or legal advice.
 - The statuses must stay distinct: `ALLOWED`, `BLOCKED`, `REVIEW_REQUIRED`,
-  `ERROR`, `UNREACHABLE`, `DISCOVERED`, `CHECKING`. `ERROR` (for example an
-  unreadable robots.txt) and `UNREACHABLE` both pause the source and never mean
-  allowed.
+  `ERROR`, `UNREACHABLE`, `DISCOVERED`, `CHECKING`. `BLOCKED` means a rule
+  forbids collection, or the source refused the reachability request (401, 403
+  or another 4xx). `ERROR` (for example an unreadable robots.txt) and
+  `UNREACHABLE` (timeout, network failure or 5xx) both pause the source and
+  never mean allowed.
+- robots.txt is evaluated as this client's product token, `ResearchScout`
+  (the transport User-Agent is `ResearchScout/0.1`), not only as `*`: a rule
+  written for `ResearchScout` applies even when no wildcard group exists.
+- `REVIEW_REQUIRED` never becomes `ALLOWED` by itself. Only an explicit user
+  authorisation releases it; the authorisation is written to
+  `archive/registry/source_policies.jsonl` with a scope (paths and access
+  method) and an `expires_at`. `BLOCKED`, `ERROR` and `UNREACHABLE` cannot be
+  overridden, and an authorisation is a product action, not a legal licence.
 - The compliance check is a mandatory independent module: every source, every
   round and every expansion passes through `scripts/compliance_gate.py` first;
   `collector.assert_compliance_allows` is the structural backstop, and only
@@ -349,6 +377,7 @@ is no need to wait for the whole research to finish.
 │       ├── jsonl.py
 │       ├── markdown.py
 │       ├── paths.py
+│       ├── policy.py
 │       ├── render.py
 │       ├── robots.py
 │       ├── sanitize.py
@@ -373,8 +402,11 @@ is no need to wait for the whole research to finish.
 
 Implemented: compliance-first collection and source registry, classified
 archiving, the research loop (action admission, budgets, deduplication, finding
-merges, research memory), Markdown and CSV export, resume and incremental
-collection, and untrusted-content isolation.
+merges, research memory), Markdown and CSV export, untrusted-content isolation,
+and the `REVIEW_REQUIRED` user authorisation registry
+(`archive/registry/source_policies.jsonl`, with scope and expiry). Resume is
+limited to state and archive files: `state/` and the archive can be resumed,
+but v1 does not provide automatic cross-run resume.
 
 Not implemented or out of scope for v1:
 
@@ -384,15 +416,31 @@ Not implemented or out of scope for v1:
 - Vector databases, semantic retrieval, embeddings, knowledge graphs,
   multi-agent orchestration and long-running web services.
 - Semantic near-duplicate detection reports suspected pairs only and never
-  merges them.
+  merges them; it compares the round's transient `document_texts`, which are
+  never persisted.
+- The document state machine is partial: statuses advance only to `FETCHED` /
+  `EXTRACTED` / `PERSISTED` as the pipeline actually sets them;
+  `attempt_count` stays 0 for successful documents; permanent-failure retry and
+  next-round priority are not implemented, so the report's "permanent failure"
+  subsection is never populated in v1.
+- There is no automatic retry: a 5xx or 429 is a failed fetch for that round,
+  and a robots.txt failure is `ERROR` and is never retried. This is a
+  deliberate deviation from spec 10.4's bounded-retry bullet.
+- The API/feed terms dimension is absent: an rss or api source without a
+  declared terms URL is evaluated by robots.txt only.
 - `document_weights` in `config/scoring.yaml` is defined but no v1 script
   consumes it; the finding weights `finding_weights` are used by
   `scripts/reflection.py`.
+- Inert config keys: `max_attempts` and the branch/no-progress knobs
+  `max_branch_depth`, `max_active_branches`, `min_new_information_ratio` and
+  `stop_when_no_progress_rounds` are defined in `config/iteration.yaml`, but no
+  v1 script reads or enforces them.
 - There is no module that computes document-level relevance, freshness or
   authority scores automatically; the related schema fields exist, but v1 does
   not fill them.
-- `compliance_recheck_days` is defined but not used in v1: a recorded decision
-  for the same address is reused indefinitely.
+- `compliance_recheck_days` is used: a recorded compliance decision older than
+  the configured interval (30 days by default) is checked again; a missing or
+  malformed timestamp is re-checked as well.
 - Browser rendering and JavaScript pages are not handled; collection reads only
   the static content of an HTTP response.
 
