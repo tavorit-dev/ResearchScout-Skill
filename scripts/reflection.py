@@ -42,7 +42,10 @@ Merging rules (the contract ``tests/test_reflection.py`` pins):
   document, and a different ``quote`` or ``locator`` where the evidence sits
   is not new evidence. Evidence with a missing key, or not a mapping at all,
   is kept without deduplication -- losing it silently would be worse than a
-  duplicate.
+  duplicate. An *empty-string* or non-string ``document_id`` or
+  ``evidence_type`` also counts as keyless: it is not a usable identity
+  component, and treating it as one would either merge unrelated records or
+  raise on an unhashable value.
 * On a statement match, ``confidence`` and ``importance`` come from the
   *incoming* finding whenever it carries them: the agent has just seen more
   evidence, and incoming is its current assessment; keeping the old number
@@ -96,6 +99,8 @@ import copy
 import math
 from collections.abc import Mapping
 
+from scripts.lib.markdown import neutralise_line
+
 # Weight key -> finding field, in the order spec 7.4 writes the formula.
 # Keeping the mapping here, rather than in four copies of arithmetic, is what
 # makes "the weight keys come from configuration" true in one place.
@@ -121,44 +126,13 @@ EMPTY_MARKER = "（暂无）"
 SECTION_TITLES = ("关键发现", "证据", "知识缺口", "矛盾", "下一步行动")
 
 
-def _neutralise(value):
-    """Return ``value`` as one Markdown-safe line for the rendered summary.
-
-    Every string that reaches the document -- a statement, a finding or
-    document id, an evidence type, a gap, an action's topic/type/reason -- is
-    written by an LLM that reads untrusted web pages (CLAUDE.md invariant 6),
-    so it is untrusted input. ``summaries/current.md`` is both a user-facing
-    product and layer one of the memory fed back to the model; a forged
-    ``## 下一步行动`` would read as planner output.
-
-    Only characters that carry *document structure* are neutralised; content
-    is never deleted:
-
-    * CR, LF and CRLF collapse to a single space, so no value can start a new
-      line and therefore cannot open a heading, bullet or code fence.
-    * A backtick becomes an apostrophe, so a value rendered inside a code
-      span cannot close it early and turn the rest into markup.
-    * ``#`` is backslash-escaped, so the text ``## 知识缺口`` inside a value
-      is never mistaken for a heading (Markdown renders ``\\#`` as ``#``, so
-      no content is deleted).
-
-    Other meaning-bearing characters (``*``, ``-``, ``>`` and the like) are
-    kept as-is: once a value cannot start a line they cannot forge a section,
-    and escaping them would corrupt the reader's text. Non-strings are
-    rendered with ``str`` so a dirty value still cannot smuggle a newline in.
-    """
-    text = str(value)
-    text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-    text = text.replace("`", "'")
-    return text.replace("#", "\\#")
-
-
 def _is_real_number(value):
-    """True for int/float values that are not bool and not NaN/infinity.
+    """True for an int/float that is neither bool nor NaN/infinity.
 
     ``bool`` is excluded because ``True`` is an ``int`` in Python but is never
-    a score; silently reading it as ``1`` would hide a caller bug. NaN and
-    infinity are excluded because they poison every comparison downstream.
+    a score or a weight; silently reading it as ``1`` would hide a caller
+    bug. NaN and infinity are excluded because they poison every comparison
+    downstream.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
@@ -172,11 +146,9 @@ def _check_weight(key, value):
     zero would produce a ranking that looks normal and is wrong. That is more
     dangerous than a crash, because nobody notices it.
     """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if not _is_real_number(value):
         raise ValueError(
-            "weight %r must be a number, got %r" % (key, type(value).__name__))
-    if not math.isfinite(value):
-        raise ValueError("weight %r must be finite, got %r" % (key, value))
+            "weight %r must be a finite number, got %r" % (key, value))
     if value < 0 or value > 1:
         raise ValueError(
             "weight %r must be between 0 and 1, got %r" % (key, value))
@@ -192,11 +164,9 @@ def _score(finding, field):
     value = finding.get(field)
     if value is None:
         return 0.0
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if not _is_real_number(value):
         raise ValueError(
-            "score %r must be a number, got %r" % (field, type(value).__name__))
-    if not math.isfinite(value):
-        raise ValueError("score %r must be finite, got %r" % (field, value))
+            "score %r must be a finite number, got %r" % (field, value))
     if value < 0 or value > 100:
         raise ValueError(
             "score %r must be between 0 and 100, got %r" % (field, value))
@@ -372,6 +342,21 @@ def _append_once(bucket, seen_ids, record):
     bucket.append(record)
 
 
+def _skipped_copy(record):
+    """Return a private copy of a skipped record, or the record itself.
+
+    ``skipped`` is a report and must never raise: an unmatchable entry can be
+    a generator or an object whose ``__deepcopy__`` raises, and aborting the
+    whole round over a record that is already being set aside would be worse
+    than sharing the object. A deep copy is used when possible so the result
+    does not alias the caller's data.
+    """
+    try:
+        return copy.deepcopy(record)
+    except Exception:
+        return record
+
+
 def merge_findings(current, incoming):
     """Merge newly extracted findings into the current research memory.
 
@@ -427,10 +412,12 @@ def merge_findings(current, incoming):
     (whitespace only), and any non-mapping entry in ``incoming``, cannot be
     matched. Such records are **not** appended as findings -- one statement-
     less finding would make a later validate-everything-then-write step reject
-    the whole round -- and they do **not** disappear silently either: a deep
-    copy of each is returned in ``skipped`` so the caller can report or repair
-    it. ``skipped`` is always present and is an empty list when nothing was
-    skipped.
+    the whole round -- and they do **not** disappear silently either: a copy
+    of each is returned in ``skipped`` so the caller can report or repair it.
+    A record that cannot be deep-copied (a generator, an object whose
+    ``__deepcopy__`` raises) is put there as the original object rather than
+    aborting the round. ``skipped`` is always present and is an empty list
+    when nothing was skipped.
 
     Neither input is modified, and the result does not alias either one.
     """
@@ -456,12 +443,12 @@ def merge_findings(current, incoming):
 
     for record in incoming:
         if not isinstance(record, dict):
-            skipped.append(copy.deepcopy(record))
+            skipped.append(_skipped_copy(record))
             continue
 
         statement = record.get("statement")
         if not (isinstance(statement, str) and statement.strip()):
-            skipped.append(copy.deepcopy(record))
+            skipped.append(_skipped_copy(record))
             continue
 
         position = by_statement.get(statement)
@@ -506,14 +493,14 @@ def _format_number(value):
 def _statement_of(finding):
     statement = finding.get("statement")
     if isinstance(statement, str) and statement.strip():
-        return _neutralise(statement)
+        return neutralise_line(statement)
     return "（无陈述）"
 
 
 def _finding_id_of(finding):
     finding_id = finding.get("finding_id")
     if isinstance(finding_id, str) and finding_id:
-        return _neutralise(finding_id)
+        return neutralise_line(finding_id)
     return "（无 ID）"
 
 
@@ -590,8 +577,10 @@ def summarize_state(findings, actions, gaps):
             if not isinstance(evidence_type, str) or not evidence_type:
                 evidence_type = "（未知类型）"
             evidence_lines.append(
-                "- `%s` ← `%s`（%s）" % (finding_id, _neutralise(document_id),
-                                         _neutralise(evidence_type)))
+                "- `%s` ← `%s`（%s）" % (
+                    finding_id,
+                    neutralise_line(document_id),
+                    neutralise_line(evidence_type)))
 
     gap_lines = []
     for gap in gaps:
@@ -601,7 +590,7 @@ def summarize_state(findings, actions, gaps):
             # A blank gap would render a bare "- " line, which reads as a
             # malformed document. There is no content to show.
             continue
-        gap_lines.append("- %s" % _neutralise(gap))
+        gap_lines.append("- %s" % neutralise_line(gap))
 
     contradiction_lines = []
     for item in ordered:
@@ -617,7 +606,7 @@ def summarize_state(findings, actions, gaps):
                 # a contradiction even when its document is unknown, so do
                 # not drop it and render （暂无）.
                 document_id = "（未知文档）"
-            documents.append("`%s`" % _neutralise(document_id))
+            documents.append("`%s`" % neutralise_line(document_id))
         if documents:
             contradiction_lines.append(
                 "- **%s**（`%s`）：%s 提出相反证据（contradicts）"
@@ -627,19 +616,19 @@ def summarize_state(findings, actions, gaps):
     action_lines = []
     for action in actions:
         if not isinstance(action, dict):
-            action_lines.append("- %s" % _neutralise(action))
+            action_lines.append("- %s" % neutralise_line(action))
             continue
         headline = ""
         if action.get("topic"):
-            headline = "**%s**" % _neutralise(action["topic"])
+            headline = "**%s**" % neutralise_line(action["topic"])
         if action.get("type"):
             if headline:
-                headline += "（`%s`）" % _neutralise(action["type"])
+                headline += "（`%s`）" % neutralise_line(action["type"])
             else:
-                headline = "`%s`" % _neutralise(action["type"])
+                headline = "`%s`" % neutralise_line(action["type"])
         pieces = [headline] if headline else []
         if action.get("reason"):
-            pieces.append("%s" % _neutralise(action["reason"]))
+            pieces.append("%s" % neutralise_line(action["reason"]))
         if pieces:
             action_lines.append("- " + "：".join(pieces))
         else:
