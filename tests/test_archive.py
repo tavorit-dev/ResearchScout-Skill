@@ -1,10 +1,12 @@
 # tests/test_archive.py
 import csv
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 from jsonschema import ValidationError
 
@@ -274,6 +276,191 @@ class TestSummaryAndIteration(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     save_iteration(self.root, bad, {"decision": "CONTINUE"})
         self.assertEqual(list((self.root / "iterations").iterdir()), [])
+
+
+class TestWritersEnforceRecordShape(unittest.TestCase):
+    """I1: a writer refuses a payload its own reader cannot read back."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = ensure_research_layout(self.tmp / "security" / "ai-agent-security")
+
+    def test_save_state_rejects_non_mapping_and_keeps_previous_state(self):
+        save_state(self.root, {"round": 3})
+        state_path = self.root / "state" / "current.json"
+        before = state_path.read_bytes()
+        with self.assertRaises(TypeError) as ctx:
+            save_state(self.root, [1, 2])
+        self.assertIn("list", str(ctx.exception))
+        self.assertEqual(state_path.read_bytes(), before)
+        self.assertEqual(load_state(self.root), {"round": 3})
+
+    def test_save_iteration_rejects_non_mapping_record(self):
+        with self.assertRaises(TypeError) as ctx:
+            save_iteration(self.root, 0, "scalar")
+        self.assertIn("str", str(ctx.exception))
+        self.assertEqual(list((self.root / "iterations").iterdir()), [])
+
+
+class TestAtomicWriters(unittest.TestCase):
+    """I2: a failed os.replace keeps the old bytes and leaves no temp file."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = ensure_research_layout(self.tmp / "security" / "ai-agent-security")
+
+    def test_save_state_keeps_old_state_when_replace_fails(self):
+        save_state(self.root, {"round": 1})
+        state_path = self.root / "state" / "current.json"
+        before = state_path.read_bytes()
+        with mock.patch("scripts.archive.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                save_state(self.root, {"round": 2})
+        self.assertEqual(state_path.read_bytes(), before)
+        self.assertEqual(list((self.root / "state").glob(".current.json.*")), [])
+        self.assertEqual(load_state(self.root), {"round": 1})
+
+    def test_save_findings_keeps_old_file_when_replace_fails(self):
+        save_findings(self.root, [dict(FINDING)])
+        findings_path = self.root / "findings" / "findings.jsonl"
+        before = findings_path.read_bytes()
+        with mock.patch("scripts.archive.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                save_findings(
+                    self.root,
+                    [dict(FINDING), dict(FINDING, finding_id="find_2")],
+                )
+        self.assertEqual(findings_path.read_bytes(), before)
+        self.assertEqual(
+            list((self.root / "findings").glob(".findings.jsonl.*")), []
+        )
+
+
+class TestWritersRefuseToInventProject(unittest.TestCase):
+    """I3: a writer never creates the project it was asked to write into."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_writers_require_an_initialised_project(self):
+        cases = {
+            "save_state": lambda root: save_state(root, {"round": 0}),
+            "save_documents": lambda root: save_documents(root, [dict(DOCUMENT)]),
+            "save_documents_empty": lambda root: save_documents(root, []),
+            "save_findings": lambda root: save_findings(root, [dict(FINDING)]),
+            "save_iteration": lambda root: save_iteration(
+                root, 1, {"decision": "CONTINUE"}
+            ),
+            "save_summary": lambda root: save_summary(root, "text"),
+            "export_csv": lambda root: export_csv(root),
+        }
+        for name, call in cases.items():
+            with self.subTest(writer=name):
+                root = self.tmp / name
+                with self.assertRaises(FileNotFoundError) as ctx:
+                    call(root)
+                self.assertIn(str(root), str(ctx.exception))
+                self.assertFalse(root.exists())
+
+    def test_rebuild_manifest_writes_nothing_at_a_missing_root(self):
+        root = self.tmp / "manifest"
+        with self.assertRaises(FileNotFoundError):
+            rebuild_manifest(root)
+        self.assertFalse(root.exists())
+
+    def test_atomic_writer_never_creates_directories(self):
+        from scripts.archive import _atomic_write_text
+        target = self.tmp / "missing" / "deeper" / "file.txt"
+        with self.assertRaises(FileNotFoundError):
+            _atomic_write_text(target, "x")
+        self.assertFalse((self.tmp / "missing").exists())
+
+
+class TestTemporaryFileHygiene(unittest.TestCase):
+    """M1/M2: a crashed write leaves nothing behind and leaks no descriptor."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = ensure_research_layout(self.tmp / "security" / "ai-agent-security")
+
+    def test_stale_temporary_file_is_swept_before_the_next_write(self):
+        stale = self.root / "state" / ".current.json.CRASHED.tmp"
+        stale.write_text("garbage", encoding="utf-8")
+        save_state(self.root, {"round": 1})
+        self.assertFalse(stale.exists())
+        self.assertEqual(load_state(self.root), {"round": 1})
+
+    def test_fdopen_failure_closes_descriptor_and_removes_temp_file(self):
+        captured = []
+
+        def failing_fdopen(descriptor, *args, **kwargs):
+            captured.append(descriptor)
+            raise RuntimeError("fdopen failed")
+
+        with mock.patch("scripts.archive.os.fdopen", failing_fdopen):
+            with self.assertRaises(RuntimeError):
+                save_state(self.root, {"round": 1})
+        self.assertEqual(len(captured), 1)
+        with self.assertRaises(OSError):
+            os.fstat(captured[0])
+        self.assertEqual(list((self.root / "state").glob(".current.json.*")), [])
+
+
+class TestErrorMessagesNameTheRecord(unittest.TestCase):
+    """M3/M4: a failure says which record and which file, not just "invalid"."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = ensure_research_layout(self.tmp / "security" / "ai-agent-security")
+
+    def test_invalid_document_in_a_batch_names_index_and_id(self):
+        batch = [
+            dict(DOCUMENT, document_id="doc_first"),
+            dict(DOCUMENT, document_id="doc_second"),
+            dict(DOCUMENT, document_id="doc_third", crawl_status="NOT_A_STATUS"),
+        ]
+        with self.assertRaises(ValidationError) as ctx:
+            save_documents(self.root, batch)
+        message = str(ctx.exception)
+        self.assertIn("record 2", message)
+        self.assertIn("doc_third", message)
+        self.assertIsInstance(ctx.exception.__cause__, ValidationError)
+
+    def test_invalid_finding_in_a_batch_names_index_and_id(self):
+        batch = [
+            dict(FINDING, finding_id="find_first"),
+            dict(FINDING, finding_id="find_second", relevance_score=0.9),
+        ]
+        with self.assertRaises(ValidationError) as ctx:
+            save_findings(self.root, batch)
+        message = str(ctx.exception)
+        self.assertIn("record 1", message)
+        self.assertIn("find_second", message)
+        self.assertIsInstance(ctx.exception.__cause__, ValidationError)
+
+    def test_non_utf8_state_file_names_its_path(self):
+        path = self.root / "state" / "current.json"
+        path.write_bytes(b"\xff\xfe\x00not utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            load_state(self.root)
+        self.assertIn(str(path), str(ctx.exception))
+
+
+class TestRoundCounting(unittest.TestCase):
+    """M5: only files are rounds; a directory with the right name is not."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = ensure_research_layout(self.tmp / "security" / "ai-agent-security")
+
+    def test_directory_named_like_a_round_is_not_counted(self):
+        (self.root / "iterations" / "round-999.json").mkdir()
+        self.assertEqual(rebuild_manifest(self.root)["round_count"], 0)
+
+    def test_round_files_are_counted(self):
+        save_iteration(self.root, 1, {"decision": "CONTINUE"})
+        save_iteration(self.root, 2, {"decision": "DEEPEN"})
+        self.assertEqual(rebuild_manifest(self.root)["round_count"], 2)
 
 
 if __name__ == "__main__":
