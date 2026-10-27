@@ -222,11 +222,27 @@ def _scope_view(lists, confirmed):
 
 
 def _load_record(path):
-    """Read and schema-check ``research.yaml``, naming the path on failure."""
+    """Read and schema-check ``research.yaml``, naming the path on failure.
+
+    A missing file raises ``FileNotFoundError``: "there is no research record"
+    and "the research record is corrupt" are different answers for a caller
+    deciding whether to initialise the project, and ``archive.load_state``
+    draws the same line between a missing state and a malformed one. Every
+    other read failure, a YAML parse error and a schema violation raise
+    ``ValueError`` naming the offending path.
+    """
     try:
-        record = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"research record not found: {path}") from exc
+    except OSError as exc:
         raise ValueError(f"cannot read research record {path}: {exc}") from exc
+    try:
+        record = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"research record {path} is not valid YAML: {exc}"
+        ) from exc
     try:
         validate_record("research", record)
     except ValidationError as exc:

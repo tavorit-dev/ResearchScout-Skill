@@ -15,6 +15,7 @@ from scripts.lib.paths import ensure_research_layout
 from scripts.lib.validate import validate_record
 from scripts.planner import init_research
 from scripts.research_loop import apply_results, check_env, main, run_round
+from scripts.source_discovery import discover
 
 # -- fixtures ---------------------------------------------------------------
 #
@@ -54,6 +55,11 @@ PAGE = """<html><head><title>Agent Runtime Isolation</title></head>
 <body><article><p>Runtime isolation keeps agent tools in a sandbox.</p>
 </article></body></html>"""
 
+# robots.txt bodies the gate can be pointed at. ``Allow: /`` is the ordinary
+# permitted site; ``Disallow: /`` is the forged-status probe's site.
+ROBOTS_ALLOW = "User-agent: *\nAllow: /\n"
+ROBOTS_DISALLOW_ALL = "User-agent: *\nDisallow: /\n"
+
 CONFIRMED_SCOPE = {
     "core": ["Agent Security"],
     "related": ["沙箱隔离"],
@@ -63,7 +69,13 @@ CONFIRMED_SCOPE = {
 
 
 def source(**overrides):
-    """Return one verified, already-permitted feed source."""
+    """Return one verified source whose compliance decision is already recorded.
+
+    ``checked_at`` is part of the fixture on purpose: a source that carries a
+    recorded decision is not re-checked, so the collection tests below exercise
+    collection rather than the gate. The gate tests build their own source with
+    ``checked_at`` removed, which is exactly the forged-status case.
+    """
     record = {
         "source_id": "src_feed",
         "source_name": "e.org",
@@ -71,6 +83,7 @@ def source(**overrides):
         "access_method": "rss",
         "feed_url": "https://e.org/feed",
         "compliance_status": "ALLOWED",
+        "checked_at": "2026-10-01T00:00:00+00:00",
         "discovery_verified": True,
         "selection_status": "selected",
     }
@@ -119,6 +132,35 @@ def missing_fetcher():
 
     fetcher.calls = calls
     return fetcher
+
+
+def routed_fetcher(routes):
+    """Return a fetcher answering each URL from ``routes``, recording calls.
+
+    An unlisted URL is a 404. The gate requests the base URL and robots.txt
+    before collection, so a test has to say what each address returns instead
+    of letting one body answer every question.
+    """
+    calls = []
+
+    def fetcher(url, **kwargs):
+        calls.append(url)
+        result = dict(routes.get(url, {
+            "outcome": "not_found", "status": 404, "text": None,
+        }))
+        result.setdefault("final_url", url)
+        return result
+
+    fetcher.calls = calls
+    return fetcher
+
+
+def site_fetcher(*, body=FEED_ONE, robots=ROBOTS_ALLOW):
+    """Return a fetcher for one permitted site, with ``robots`` at its rules URL."""
+    return routed_fetcher({
+        "https://e.org": {"outcome": "ok", "status": 200, "text": body},
+        "https://e.org/robots.txt": {"outcome": "ok", "status": 200, "text": robots},
+    })
 
 
 def layout_root(tmp):
@@ -344,6 +386,143 @@ class TestRoundCollection(TempCase):
                             feed_url=None, base_url="https://e.org")],
         )
         self.assertEqual(handoff["new_documents"], [])
+
+
+# -- compliance gate inside the round ---------------------------------------
+
+
+class TestComplianceGateInRound(TempCase):
+    """The round must obtain a decision; a source cannot arrive pre-permitted."""
+
+    def test_discovered_source_is_gated_and_then_collected(self):
+        # The natural pipeline: init_research -> discover() -> run_round. The
+        # candidate leaves discovery as DISCOVERED, so the round itself has to
+        # run the gate before collect can accept it.
+        root = layout_root(self.tmp)
+        candidates = discover("agent security", provider="manual",
+                              payload=["https://e.org"])
+        self.assertEqual(candidates[0]["compliance_status"], "DISCOVERED")
+
+        fetcher = site_fetcher()
+        handoff = run_round(root, round_no=1, actions=[],
+                            config={"iteration_policy": {}},
+                            fetcher=fetcher, sources=candidates)
+
+        self.assertEqual(len(handoff["new_documents"]), 1)
+        self.assertEqual(len(read_records(root / "documents" / "documents.jsonl")), 1)
+
+        stored = read_records(root / "sources" / "selected_sources.jsonl")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["compliance_status"], "ALLOWED")
+        self.assertTrue(stored[0]["checked_at"])
+        self.assertEqual(stored[0]["selection_status"], "selected")
+        self.assertIs(stored[0]["discovery_verified"], True)
+        validate_record("source", stored[0])
+
+        # The gate asked for the base URL and robots.txt, then collection read
+        # the base URL the source names (access_method "web").
+        self.assertIn("https://e.org/robots.txt", fetcher.calls)
+
+    def test_forged_allowed_without_checked_at_is_rechecked(self):
+        # An ALLOWED status with no recorded check is a claim, not a decision.
+        # The round must re-run the gate rather than trust it.
+        root = layout_root(self.tmp)
+        forged = source()
+        forged.pop("checked_at")
+        self.assertEqual(forged["compliance_status"], "ALLOWED")
+
+        fetcher = site_fetcher(robots=ROBOTS_DISALLOW_ALL)
+        handoff = run_round(root, round_no=1, actions=[],
+                            config={"iteration_policy": {}},
+                            fetcher=fetcher, sources=[forged])
+
+        self.assertEqual(handoff["new_documents"], [])
+        self.assertIn("https://e.org/robots.txt", fetcher.calls)
+        # collect never ran: the feed address was never requested.
+        self.assertNotIn("https://e.org/feed", fetcher.calls)
+
+        stored = read_records(root / "sources" / "selected_sources.jsonl")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["compliance_status"], "BLOCKED")
+        self.assertTrue(stored[0]["checked_at"])
+
+        rejected = [item for item in handoff["actions_rejected"]
+                    if item.get("kind") == "source"]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["source_id"], "src_feed")
+        self.assertEqual(rejected[0]["compliance_status"], "BLOCKED")
+        self.assertIn("BLOCKED", rejected[0]["reason"])
+
+    def test_recorded_decision_is_honoured_without_a_fetch(self):
+        # A decision that carries checked_at survives across rounds: it is
+        # neither re-checked nor overridden.
+        root = layout_root(self.tmp)
+        recorded = source(compliance_status="BLOCKED",
+                          checked_at="2026-10-01T00:00:00+00:00")
+        fetcher = site_fetcher()
+
+        handoff = run_round(root, round_no=1, actions=[],
+                            config={"iteration_policy": {}},
+                            fetcher=fetcher, sources=[recorded])
+
+        self.assertEqual(handoff["new_documents"], [])
+        self.assertEqual(fetcher.calls, [])
+
+        stored = read_records(root / "sources" / "selected_sources.jsonl")
+        self.assertEqual(stored[0]["compliance_status"], "BLOCKED")
+        self.assertEqual(stored[0]["checked_at"], "2026-10-01T00:00:00+00:00")
+
+        rejected = [item for item in handoff["actions_rejected"]
+                    if item.get("kind") == "source"]
+        self.assertEqual(rejected[0]["source_id"], "src_feed")
+        self.assertEqual(rejected[0]["compliance_status"], "BLOCKED")
+        self.assertIn("BLOCKED", rejected[0]["reason"])
+
+    def test_review_required_and_error_are_skipped_and_recorded(self):
+        root = layout_root(self.tmp)
+        review = source(source_id="src_review",
+                        base_url="https://review.example",
+                        access_method="web", feed_url=None,
+                        terms_url="https://review.example/terms")
+        review.pop("checked_at")
+        error = source(source_id="src_error",
+                       base_url="https://error.example",
+                       access_method="web", feed_url=None)
+        error.pop("checked_at")
+
+        fetcher = routed_fetcher({
+            "https://review.example": {
+                "outcome": "ok", "status": 200, "text": FEED_ONE},
+            "https://review.example/robots.txt": {
+                "outcome": "ok", "status": 200, "text": ROBOTS_ALLOW},
+            "https://error.example": {
+                "outcome": "ok", "status": 200, "text": FEED_ONE},
+            "https://error.example/robots.txt": {
+                "outcome": "server_error", "status": 503, "text": None},
+        })
+
+        handoff = run_round(root, round_no=1, actions=[],
+                            config={"iteration_policy": {}},
+                            fetcher=fetcher, sources=[review, error])
+
+        self.assertEqual(handoff["new_documents"], [])
+        # Each base URL was requested once, by reachability. A second request
+        # would mean collect ran for a source that was not permitted.
+        self.assertEqual(fetcher.calls.count("https://review.example"), 1)
+        self.assertEqual(fetcher.calls.count("https://error.example"), 1)
+
+        stored = {record["source_id"]: record
+                  for record in read_records(root / "sources" / "selected_sources.jsonl")}
+        self.assertEqual(stored["src_review"]["compliance_status"], "REVIEW_REQUIRED")
+        self.assertEqual(stored["src_error"]["compliance_status"], "ERROR")
+
+        rejected = {item["source_id"]: item
+                    for item in handoff["actions_rejected"]
+                    if item.get("kind") == "source"}
+        self.assertEqual(rejected["src_review"]["compliance_status"], "REVIEW_REQUIRED")
+        self.assertEqual(rejected["src_error"]["compliance_status"], "ERROR")
+        self.assertIn("REVIEW_REQUIRED", rejected["src_review"]["reason"])
+        self.assertIn("ERROR", rejected["src_error"]["reason"])
 
 
 # -- action admission and scope ---------------------------------------------
