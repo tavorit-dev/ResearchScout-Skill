@@ -25,12 +25,18 @@ import urllib.request
 from urllib.parse import urlsplit
 
 # A neutral, honest identifier. It names this tool rather than impersonating a
-# browser, so an operator reading their logs can tell who called and reach the
-# project for questions. Never replace this with a browser User-Agent: rotating
-# or spoofing the agent is how a client circumvents an expressed access
-# restriction, which this project does not do (spec 10.4). The README must
-# document this identifier.
-USER_AGENT = "ResearchScout/0.1 (+https://github.com/research-scout)"
+# browser or claiming a remote it may not own. Never replace this with a browser
+# User-Agent: rotating or spoofing the agent is how a client circumvents an
+# expressed access restriction, which this project does not do (spec 10.4). The
+# README must document this identifier.
+USER_AGENT = "ResearchScout/0.1"
+
+# The token robots.txt is evaluated as. RFC 9309 matches a group by product
+# token, and the parser matches a token as a substring, so the bare product
+# name is the stable value to ask about. It is derived from the transport UA
+# so the two cannot drift: the gate must decide for the client it actually is,
+# never as the wildcard group.
+ROBOTS_AGENT = USER_AGENT.split("/", 1)[0]
 
 # Timeout and size defaults; config/default.yaml overrides them.
 DEFAULT_TIMEOUT = 30.0

@@ -1,5 +1,7 @@
 # tests/test_compliance_gate.py
 import unittest
+from datetime import datetime, timezone
+
 from scripts.compliance_gate import check_reachability, check_compliance
 
 
@@ -27,10 +29,12 @@ class TestReachability(unittest.TestCase):
         fetcher = fake_fetcher({"https://e.org": {"outcome": "timeout"}})
         self.assertEqual(check_reachability(src, fetcher=fetcher), "UNREACHABLE")
 
-    def test_refused_request_is_unreachable(self):
+    def test_refused_request_is_blocked(self):
+        # A 401/403/4xx is an access refusal, not a missing answer: it is
+        # BLOCKED, never UNREACHABLE and never permission.
         src = {"source_id": "src_1", "base_url": "https://e.org"}
         fetcher = fake_fetcher({"https://e.org": {"outcome": "blocked", "status": 403}})
-        self.assertEqual(check_reachability(src, fetcher=fetcher), "UNREACHABLE")
+        self.assertEqual(check_reachability(src, fetcher=fetcher), "BLOCKED")
 
     def test_oversized_body_is_unreachable(self):
         src = {"source_id": "src_1", "base_url": "https://e.org"}
@@ -130,6 +134,25 @@ class TestCompliance(unittest.TestCase):
         )
         self.assertEqual(record["compliance_status"], "UNREACHABLE")
         self.assertEqual(record["robots_status"], "not_checked")
+
+    def test_a_refused_reachability_request_is_blocked_without_robots(self):
+        calls = []
+
+        def fetcher(url, **kwargs):
+            calls.append(url)
+            return {"outcome": "blocked", "status": 403}
+
+        record = check_compliance(
+            {"source_id": "src_1", "base_url": "https://e.org", "access_method": "web"},
+            fetcher=fetcher,
+        )
+
+        self.assertEqual(record["compliance_status"], "BLOCKED")
+        self.assertEqual(record["robots_status"], "not_checked")
+        # robots.txt is not consulted for a source that refused to answer.
+        self.assertEqual(calls, ["https://e.org"])
+        self.assertTrue(any(item["type"] == "reachability"
+                            for item in record["evidence"]))
 
     def test_absent_robots_is_allowed_and_recorded(self):
         fetcher = fake_fetcher({
@@ -429,3 +452,198 @@ class TestRequestPacing(unittest.TestCase):
         )
         self.assertEqual(record["request_rate_limit"], 2.0)
         self.assertNotIn(0.5, fetcher.delays_for("https://e.org"))
+
+
+class TestRobotsEvaluatedAsThisClient(unittest.TestCase):
+    """robots.txt is queried as ResearchScout, not as the wildcard (C1)."""
+
+    def _record(self, robots):
+        fetcher = fake_fetcher({
+            "https://e.org": {"outcome": "ok", "status": 200},
+            "https://e.org/robots.txt": {
+                "outcome": "ok", "status": 200, "text": robots,
+            },
+        })
+        return check_compliance(
+            {"source_id": "src_1", "base_url": "https://e.org",
+             "access_method": "web"},
+            fetcher=fetcher,
+        )
+
+    def test_a_specific_disallow_blocks_without_a_wildcard_group(self):
+        record = self._record("User-agent: ResearchScout\nDisallow: /\n")
+        self.assertEqual(record["compliance_status"], "BLOCKED")
+        self.assertEqual(record["allowed_paths"], [])
+
+    def test_a_wildcard_only_site_still_allows(self):
+        record = self._record("User-agent: *\nAllow: /\n")
+        self.assertEqual(record["compliance_status"], "ALLOWED")
+
+    def test_a_specific_group_sets_the_crawl_delay(self):
+        record = self._record(
+            "User-agent: ResearchScout\nCrawl-delay: 7\n\n"
+            "User-agent: *\nCrawl-delay: 1\n"
+        )
+        self.assertEqual(record["request_rate_limit"], 7.0)
+
+
+class TestDeclaredRobotsUrlBoundToOrigin(unittest.TestCase):
+    """An explicit robots URL on another origin is never fetched (Minor 11)."""
+
+    def test_an_off_origin_robots_url_is_refused_before_any_request(self):
+        calls = []
+
+        def fetcher(url, **kwargs):
+            calls.append(url)
+            return {"outcome": "ok", "status": 200,
+                    "text": "User-agent: *\nAllow: /\n"}
+
+        record = check_compliance(
+            {
+                "source_id": "src_1",
+                "base_url": "https://e.org",
+                "access_method": "web",
+                "robots_url": "https://evil.example/robots.txt",
+            },
+            fetcher=fetcher,
+        )
+
+        self.assertEqual(record["compliance_status"], "ERROR")
+        self.assertIsNone(record["checked_at"])
+        self.assertEqual(calls, [])
+        self.assertTrue(any(item["type"] == "robots_url"
+                            for item in record["evidence"]))
+
+    def test_a_same_origin_robots_url_is_consulted(self):
+        calls = []
+
+        def fetcher(url, **kwargs):
+            calls.append(url)
+            if url.endswith("/custom-robots.txt"):
+                return {"outcome": "ok", "status": 200,
+                        "text": "User-agent: *\nAllow: /\n"}
+            return {"outcome": "ok", "status": 200}
+
+        record = check_compliance(
+            {
+                "source_id": "src_1",
+                "base_url": "https://e.org",
+                "access_method": "web",
+                "robots_url": "https://e.org/custom-robots.txt",
+            },
+            fetcher=fetcher,
+        )
+
+        self.assertEqual(record["compliance_status"], "ALLOWED")
+        self.assertIn("https://e.org/custom-robots.txt", calls)
+
+
+class TestUserAuthorisationPolicies(unittest.TestCase):
+    """V13: a live, scoped, expiring policy releases only REVIEW_REQUIRED."""
+
+    NOW = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
+
+    def _policy(self, **overrides):
+        record = {
+            "source_id": "src_1",
+            "resolved_status": "ALLOWED",
+            "resolved_by": "user",
+            "resolved_at": "2026-10-01T00:00:00+00:00",
+            "reason": "The user reviewed the terms.",
+            "scope": {
+                "paths": ["/"],
+                "access_method": "web",
+                "expires_at": "2026-11-01T00:00:00+00:00",
+            },
+            "check_record_ref": "src_1",
+        }
+        record.update(overrides)
+        return record
+
+    def _source(self, **overrides):
+        record = {
+            "source_id": "src_1",
+            "base_url": "https://e.org",
+            "access_method": "web",
+            "terms_url": "https://e.org/terms",
+        }
+        record.update(overrides)
+        return record
+
+    def _fetcher(self, robots="User-agent: *\nAllow: /\n", base=None):
+        return fake_fetcher({
+            "https://e.org": base or {"outcome": "ok", "status": 200},
+            "https://e.org/robots.txt": {
+                "outcome": "ok", "status": 200, "text": robots,
+            },
+        })
+
+    def _check(self, policies, robots="User-agent: *\nAllow: /\n", **overrides):
+        return check_compliance(
+            self._source(**overrides),
+            fetcher=self._fetcher(robots),
+            policies=policies,
+            now=self.NOW,
+        )
+
+    def test_a_valid_policy_releases_review_required(self):
+        record = self._check([self._policy()])
+        self.assertEqual(record["compliance_status"], "ALLOWED")
+        self.assertTrue(any(item["type"] == "source_policy"
+                            for item in record["evidence"]))
+
+    def test_an_expired_policy_leaves_review_required(self):
+        record = self._check([self._policy(scope={
+            "paths": ["/"],
+            "access_method": "web",
+            "expires_at": "2026-10-01T00:00:00+00:00",
+        })])
+        self.assertEqual(record["compliance_status"], "REVIEW_REQUIRED")
+
+    def test_an_out_of_scope_path_leaves_review_required(self):
+        record = self._check([self._policy(scope={
+            "paths": ["/private"],
+            "access_method": "web",
+            "expires_at": "2026-11-01T00:00:00+00:00",
+        })])
+        self.assertEqual(record["compliance_status"], "REVIEW_REQUIRED")
+
+    def test_an_access_method_mismatch_leaves_review_required(self):
+        record = self._check([self._policy(scope={
+            "paths": ["/"],
+            "access_method": "rss",
+            "expires_at": "2026-11-01T00:00:00+00:00",
+        })])
+        self.assertEqual(record["compliance_status"], "REVIEW_REQUIRED")
+
+    def test_a_blocked_policy_never_allows(self):
+        record = self._check([self._policy(resolved_status="BLOCKED")])
+        self.assertEqual(record["compliance_status"], "REVIEW_REQUIRED")
+
+    def test_a_policy_cannot_relax_a_robots_refusal(self):
+        record = self._check(
+            [self._policy()], robots="User-agent: *\nDisallow: /\n"
+        )
+        self.assertEqual(record["compliance_status"], "BLOCKED")
+
+    def test_a_policy_cannot_relax_a_robots_error(self):
+        record = check_compliance(
+            self._source(),
+            fetcher=fake_fetcher({
+                "https://e.org": {"outcome": "ok", "status": 200},
+                "https://e.org/robots.txt": {"outcome": "server_error",
+                                             "status": 503},
+            }),
+            policies=[self._policy()],
+            now=self.NOW,
+        )
+        self.assertEqual(record["compliance_status"], "ERROR")
+
+    def test_a_policy_cannot_relax_an_unreachable_source(self):
+        record = check_compliance(
+            self._source(),
+            fetcher=fake_fetcher({"https://e.org": {"outcome": "timeout"}}),
+            policies=[self._policy()],
+            now=self.NOW,
+        )
+        self.assertEqual(record["compliance_status"], "UNREACHABLE")
