@@ -57,9 +57,10 @@ The scripts do not call a model service and do not need an API key.
 
 The example below runs one minimal research round. **Every address, title and
 piece of text is constructed**: `e.org` is a reserved domain, not a real crawl
-result, and it is not guaranteed to answer. Replace it with sources you have
-confirmed yourself. This section gives complete, runnable steps; `SKILL.md`
-wins on any conflict.
+result, and it may not resolve. Replace it with real sources you have confirmed
+yourself. If step 4 produces an empty `sources.json`, steps 5-7 yield an empty
+round and an empty export; that is expected. This section gives complete,
+runnable steps; `SKILL.md` wins on any conflict.
 
 0. Check the environment:
 
@@ -113,8 +114,10 @@ confirms them.
 
 3. Confirm the scope. The snippet below writes `core` / `related` / `excluded` to
    `research.yaml` and writes `{"confirmed": true, "lists": {...}}` to
-   `state/scope.json`. **An unconfirmed scope refuses every action
-   (`rejected_as: "unconfirmed_scope"`), and that round collects nothing.**
+   `state/scope.json`. An unconfirmed scope refuses every **proposed action**
+   (`rejected_as: "unconfirmed_scope"`); when every proposed action is refused,
+   the round collects nothing. A sources-only round with no proposed actions
+   still collects the confirmed sources after passing the compliance gate.
 
 ```bash
 python3 - <<'PY'
@@ -145,9 +148,12 @@ PY
 
 4. Confirm sources and check reachability. After the user confirms which
    candidates may be read, write their `source_id` values to
-   `confirmed-sources.json`. The snippet below probes those candidates only: an
-   unconfirmed candidate is never probed, verified or collected. Reachability
-   only says whether an address answers; it is not a permission decision.
+   `confirmed-sources.json`. The file is an array of source ids, for example
+   `["src_xxxxxxxx"]` (a constructed example; replace it with the real
+   `source_id` values from `candidates.json` that you confirmed). The snippet
+   below probes those candidates only: an unconfirmed candidate is never
+   probed, verified or collected. Reachability only says whether an address
+   answers; it is not a permission decision.
 
 ```bash
 python3 - <<'PY'
@@ -197,9 +203,24 @@ python3 scripts/research_loop.py --root archive/industry/example-topic \
 ```
 
 `results.json` must contain
-`{handoff, observations, findings, next_actions, decision}`; see "Handoff and
-backfill shapes" in `SKILL.md`. Rounds must be applied in order; re-applying the
-same round is allowed as a retry.
+`{handoff, observations, findings, next_actions, decision}`. Put the handoff
+printed in step 5 verbatim into the `handoff` field; the minimal shape is below
+(empty values for the other keys are enough to let the round run, while real
+research should fill in the host's observations and findings):
+
+```text
+{
+  "handoff": <the handoff object printed in step 5>,
+  "observations": {},
+  "findings": [],
+  "next_actions": [],
+  "decision": "CONTINUE"
+}
+```
+
+`decision` must be one of the eight terminal loop states; see "Handoff and
+backfill shapes" in `SKILL.md` for the full shape. Rounds must be applied in
+order; re-applying the same round is allowed as a retry.
 
 7. Export:
 
@@ -223,7 +244,9 @@ is no need to wait for the whole research to finish.
 - **Candidate list**: every `provider="llm"` candidate has
   `discovery_verified: false` and `discovery_method: "llm"`, meaning it comes
   from model knowledge and is unverified. Unconfirmed candidates appear only in
-  `candidates_for_review` and are never collected.
+  this round's handoff `candidates_for_review`; a schema-valid unconfirmed
+  candidate is also written as a review record to
+  `sources/selected_sources.jsonl`, but none of them are ever collected.
 - **Reachability check**: one request per user-confirmed candidate to see
   whether the address answers. It is not collection, and it is not permission.
 - **Round handoff**: `new_documents` (metadata only), `document_texts` (the new

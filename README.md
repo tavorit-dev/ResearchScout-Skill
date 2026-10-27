@@ -48,8 +48,9 @@ python3 scripts/research_loop.py --check-env
 ## 快速开始（10 分钟）
 
 下面用一个最小项目走完一轮研究。**所有地址、标题与文本都是构造示例**：
-`e.org` 是保留域名，不是真实抓取结果，也不保证可达；实际使用时请换成你自己确认
-的来源。本节给出完整可执行的步骤；与 `SKILL.md` 的「First run」冲突时以
+`e.org` 是保留域名，不是真实抓取结果，也可能无法解析；请换成你自己确认的真实
+来源。如果第 4 步得到空的 `sources.json`，第 5-7 步会得到空轮次与空导出，这是
+预期行为。本节给出完整可执行的步骤；与 `SKILL.md` 的「First run」冲突时以
 `SKILL.md` 为准。
 
 0. 检查环境：
@@ -102,8 +103,10 @@ PY
 必须由用户确认后才能做真实请求。
 
 3. 确认范围。下面的片段把 `core` / `related` / `excluded` 写入 `research.yaml`，
-   并把 `{"confirmed": true, "lists": {...}}` 写入 `state/scope.json`。**未确认的
-   范围会让每个行动都被拒绝（`rejected_as: "unconfirmed_scope"`），该轮不会采集。**
+   并把 `{"confirmed": true, "lists": {...}}` 写入 `state/scope.json`。未确认的
+   范围会让每个**被提出的行动**被拒绝（`rejected_as: "unconfirmed_scope"`）；
+   当所有被提出的行动都被拒绝时，该轮不采集。没有提出行动的 sources-only 轮次
+   仍会在通过合规闸门后采集已确认来源。
 
 ```bash
 python3 - <<'PY'
@@ -133,8 +136,10 @@ PY
 ```
 
 4. 确认来源并做可达性检查。用户确认哪些候选可读后，把它们的 `source_id` 写入
-   `confirmed-sources.json`。下面的片段只探测这些被确认的候选：未确认的候选不会
-   被探测、验证或采集。可达性只回答地址是否响应，不是许可决定。
+   `confirmed-sources.json`。该文件是一个 source_id 数组，例如
+   `["src_xxxxxxxx"]`（构造示例；请替换为 `candidates.json` 中你确认的真实
+   `source_id`）。下面的片段只探测这些被确认的候选：未确认的候选不会被探测、
+   验证或采集。可达性只回答地址是否响应，不是许可决定。
 
 ```bash
 python3 - <<'PY'
@@ -180,9 +185,22 @@ python3 scripts/research_loop.py --root archive/industry/example-topic \
   --apply results.json
 ```
 
-`results.json` 必须包含 `{handoff, observations, findings, next_actions, decision}`，
-形状见 `SKILL.md` 的「Handoff and backfill shapes」。轮次必须按顺序应用；重复
-应用同一轮是允许的重试。
+`results.json` 必须包含 `{handoff, observations, findings, next_actions, decision}`。
+把第 5 步打印的 handoff 原样放进 `handoff` 字段；最小形状如下（其余键给空值即可
+让本轮跑通，真实研究应填入宿主产出的 observations 与 findings）：
+
+```text
+{
+  "handoff": <第 5 步打印的 handoff 对象>,
+  "observations": {},
+  "findings": [],
+  "next_actions": [],
+  "decision": "CONTINUE"
+}
+```
+
+`decision` 必须是八个循环终止状态之一；完整形状见 `SKILL.md` 的「Handoff and
+backfill shapes」。轮次必须按顺序应用；重复应用同一轮是允许的重试。
 
 7. 导出：
 
@@ -204,7 +222,8 @@ PY
 
 - **候选清单**：`provider="llm"` 的候选全部是 `discovery_verified: false`、
   `discovery_method: "llm"`，表示它们来自模型知识、未经验证。未确认的候选只出现
-  在 `candidates_for_review`，不会进入采集。
+  在本轮 handoff 的 `candidates_for_review`；通过 Schema 校验的未确认候选还会以
+  review 记录写入 `sources/selected_sources.jsonl`，但都不会进入采集。
 - **可达性检查**：只对用户确认的候选各发一次请求，判断地址是否响应。这不是采集，
   也不是许可。
 - **轮次 handoff**：`new_documents`（仅元数据）、`document_texts`（本轮新文档的
