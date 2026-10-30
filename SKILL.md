@@ -21,13 +21,17 @@ and the proposal of the next direction.
 - An LLM host that can read this file and execute local commands.
 - Python 3 with `requirements.txt` installed. A missing dependency prevents the
   scripts from starting at all, so install them first.
-- Run every command from the Skill root. The examples below assume that.
-- Check readiness with `python3 scripts/research_loop.py --check-env`. After the
+- The commands below locate the Skill root through `${CLAUDE_SKILL_DIR}`, which
+  Claude Code expands to the directory containing this file. A host that does
+  not substitute it should treat `${CLAUDE_SKILL_DIR}` as the Skill root and run
+  every command from there.
+- Check readiness with
+  `python3 "${CLAUDE_SKILL_DIR}/scripts/research_loop.py" --check-env`. After the
   dependencies are installed it reports the Python version and host readiness,
   and writes no files. In a hostless environment run
-  `python3 scripts/research_loop.py --check-env --no-host`: the report states
-  that the Skill cannot run on its own and exits non-zero, still writing
-  nothing (V11).
+  `python3 "${CLAUDE_SKILL_DIR}/scripts/research_loop.py" --check-env --no-host`:
+  the report states that the Skill cannot run on its own and exits non-zero,
+  still writing nothing (V11).
 
 `scripts/research_loop.py` is the only module with a command line. The planner,
 source discovery, compliance gate and exporter are Python functions; this
@@ -102,7 +106,8 @@ An action has these required fields, from `schemas/action.schema.json`:
 Run one round. Provide at least one of `--actions` or `--sources`:
 
 ```bash
-python3 scripts/research_loop.py --root archive/<domain>/<topic> \
+python3 "${CLAUDE_SKILL_DIR}/scripts/research_loop.py" \
+  --root archive/<domain>/<topic> \
   --round <N> --actions actions.json --sources sources.json
 ```
 
@@ -222,8 +227,8 @@ For `kind: "action"` entries:
 Write one results object and apply it:
 
 ```bash
-python3 scripts/research_loop.py --root archive/<domain>/<topic> \
-  --apply results.json
+python3 "${CLAUDE_SKILL_DIR}/scripts/research_loop.py" \
+  --root archive/<domain>/<topic> --apply results.json
 ```
 
 The payload is `{handoff, observations, findings, next_actions, decision}`.
@@ -590,15 +595,16 @@ unverified candidate that was not confirmed never reaches the gate and stays in
 the round; the host never marks a source `ALLOWED` itself:
 
 ```bash
-python3 scripts/research_loop.py --root archive/industry/example-topic \
+python3 "${CLAUDE_SKILL_DIR}/scripts/research_loop.py" \
+  --root archive/industry/example-topic \
   --round 1 --sources sources.json
 ```
 
 6. Do the semantic work (steps 3-5 above), then apply:
 
 ```bash
-python3 scripts/research_loop.py --root archive/industry/example-topic \
-  --apply results.json
+python3 "${CLAUDE_SKILL_DIR}/scripts/research_loop.py" \
+  --root archive/industry/example-topic --apply results.json
 ```
 
 7. Export Markdown and CSV after any round that produced work:
