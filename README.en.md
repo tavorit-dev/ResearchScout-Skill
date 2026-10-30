@@ -4,7 +4,8 @@ Research Scout is a Skill for iterative information collection and knowledge
 retention in industry research. It turns one research topic into a resumable,
 traceable local knowledge archive: discover candidate sources, check each one
 for compliance, collect and deduplicate, let the LLM host extract findings and
-evidence, update the archive every round, and finally export Markdown and CSV.
+evidence, update the archive every round, and finally export Markdown, CSV and
+a static HTML viewer.
 
 It is not a general-purpose crawler and not a long-running service. It uses no
 database, no vector search and no multi-agent orchestration. It consists of two
@@ -255,6 +256,22 @@ PY
 `reports/research-report.md`. Export after any round that produced work; there
 is no need to wait for the whole research to finish.
 
+8. Build the static HTML viewer (repeatable at any time):
+
+```bash
+python3 scripts/research_loop.py --root archive/industry/example-topic \
+  --build-viewer
+```
+
+The output is written to `archive/industry/example-topic/viewer/`; open
+`index.html` in a browser. It contains the research overview, report, findings,
+a filterable document list, one page per document, sources and compliance
+status, and the iteration history. The viewer only reads the archive: it opens
+no socket and modifies no record. When a document body was not retained, the
+page shows metadata, the saved summary and a link to the original address. The
+report page reads the last exported `reports/research-report.md`, so run step 7
+first when the report should reflect the newest round.
+
 ## What the First Run Shows
 
 - **Candidate list**: every `provider="llm"` candidate has
@@ -383,6 +400,9 @@ is no need to wait for the whole research to finish.
 │       ├── sanitize.py
 │       ├── urlnorm.py
 │       └── validate.py
+├── templates/
+│   ├── app.js
+│   └── styles.css
 └── tests/
     ├── __init__.py
     ├── fixtures/
@@ -394,24 +414,25 @@ is no need to wait for the whole research to finish.
 - `scripts/research_loop.py` is the only command-line entry point; `planner`,
   `source_discovery`, `compliance_gate` and `exporter` are module functions with
   no CLI. See `SKILL.md` for how to call them.
-- `scripts/viewer.py` is a Phase 5 placeholder and raises
-  `NotImplementedError`.
+- `scripts/viewer.py` builds the static HTML viewer; it is invoked by
+  `research_loop.py --build-viewer` and writes `<project>/viewer/`.
+- `templates/` holds the viewer's stylesheet and filter script, shared by every
+  project.
 - `archive/` is created on first run and is ignored by `.gitignore`.
 
 ## v1 Scope and Not Implemented
 
 Implemented: compliance-first collection and source registry, classified
 archiving, the research loop (action admission, budgets, deduplication, finding
-merges, research memory), Markdown and CSV export, untrusted-content isolation,
-and the `REVIEW_REQUIRED` user authorisation registry
+merges, research memory), Markdown and CSV export, the static HTML viewer,
+untrusted-content isolation, and the `REVIEW_REQUIRED` user authorisation
+registry
 (`archive/registry/source_policies.jsonl`, with scope and expiry). Resume is
 limited to state and archive files: `state/` and the archive can be resumed,
 but v1 does not provide automatic cross-run resume.
 
 Not implemented or out of scope for v1:
 
-- Static HTML viewer (Phase 5): `scripts/viewer.py` is a placeholder; there is
-  no `templates/` or `viewer/` directory in the repository.
 - Third-party search providers: interface only.
 - Vector databases, semantic retrieval, embeddings, knowledge graphs,
   multi-agent orchestration and long-running web services.

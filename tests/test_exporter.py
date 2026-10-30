@@ -20,7 +20,6 @@ from scripts.lib.jsonl import append_record
 from scripts.lib.paths import ensure_research_layout, research_dir
 from scripts.planner import init_research
 from scripts.reflection import summarize_state
-from scripts.viewer import build
 
 REPORT_REL = Path("reports") / "research-report.md"
 
@@ -146,13 +145,6 @@ class TestBriefContract(TestExporterBase):
         self.assertTrue(paths["csv"].exists())
         self.assertEqual(paths["report"], root / REPORT_REL)
         self.assertTrue(paths["report"].exists())
-
-
-class TestViewerPlaceholder(unittest.TestCase):
-    def test_raises_with_phase_note(self):
-        with self.assertRaises(NotImplementedError) as ctx:
-            build(Path("/tmp/archive"))
-        self.assertIn("Phase 5", str(ctx.exception))
 
 
 class TestPopulatedReport(TestExporterBase):

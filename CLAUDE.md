@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 不实现任何绕过访问限制的能力（更换 User-Agent、代理、验证码绕过）。
 - v1 代码已在 `scripts/` 落地；实际目录结构与脚本命名以 `README.md` 的
   「目录结构」一节为准。`docs/prd-refactor.md` 第六章是设计记录，其中
-  `relevance_ranker`、`templates/`、`viewer/` 尚未实现。
+  `relevance_ranker` 尚未实现。
 
 `docs/` 下的两份文档是设计记录，不是规范：`prd-init.md` 是最初的「分阶段爬虫」
 方案，`prd-refactor.md` 是对它的修订，改为 ReAct 式研究循环 + 主题约束 + 分类
@@ -79,11 +79,11 @@ LLM 只负责语义相关性判断、结构化摘要、跨文档综合与后续�
 | --- | --- |
 | `SKILL.md` | 入口、工作流、通用强约束、状态选择、文件索引 |
 | `config/` | `default.yaml`、`scoring.yaml`、`iteration.yaml` |
-| `scripts/` | `action_gate` / `archive` / `collector` / `compliance_gate` / `content_extractor` / `deduplicator` / `exporter` / `planner` / `reflection` / `research_loop` / `source_discovery` / `viewer`（Phase 5 占位）与 `lib/` |
+| `scripts/` | `action_gate` / `archive` / `collector` / `compliance_gate` / `content_extractor` / `deduplicator` / `exporter` / `planner` / `reflection` / `research_loop` / `source_discovery` / `viewer`（静态 HTML 生成）与 `lib/` |
 | `schemas/` | `research` / `source` / `document` / `finding` / `action` 五份 JSON Schema |
 | `archive/registry/` | v1 未实现（实际来源登记是每个项目的 `sources/selected_sources.jsonl`） |
 | `archive/<领域>/<主题>/` | 单个研究项目的全部数据（见下） |
-| `templates/` + `viewer/` | Phase 5 未实现（静态 HTML 查看器的模板与样式脚本） |
+| `templates/` | 静态 HTML 查看器的样式与筛选脚本；生成的 `viewer/` 位于各研究项目内 |
 
 单个研究项目内部：`research.yaml`、`state/`（`current.json`、`scope.json`、
 `pending_actions.json`）、`sources/`、`documents/`、`findings/`、`iterations/`、
@@ -196,12 +196,15 @@ python3 scripts/research_loop.py --root archive/<领域>/<主题> --round <N> \
 
 # 宿主回填语义结果后持久化一轮
 python3 scripts/research_loop.py --root archive/<领域>/<主题> --apply results.json
+
+# 生成静态 HTML 查看器（输出到 <项目>/viewer/）
+python3 scripts/research_loop.py --root archive/<领域>/<主题> --build-viewer
 ```
 
 `scripts/research_loop.py` 是唯一的命令行入口。`planner`、
 `source_discovery`、`compliance_gate`、`exporter` 是模块函数，没有 CLI；调用
-片段见 `SKILL.md` 的 Prerequisites 与 First run 两节。`scripts/viewer.py` 是
-Phase 5 占位，调用时抛出 `NotImplementedError`。
+片段见 `SKILL.md` 的 Prerequisites 与 First run 两节。`scripts/viewer.py` 提供
+`build(root)`，由 `--build-viewer` 调用，生成静态页面。
 
 Python 标准库优先；引入第三方依赖需在 `requirements.txt` 中声明，依赖理由写在
 `README.md` 的安装一节。

@@ -111,6 +111,7 @@ from scripts.lib.validate import validate_record
 from scripts.planner import load_research
 from scripts.reflection import (FINDING_SCORE_FIELDS, compute_weight,
                                 merge_findings, summarize_state)
+from scripts.viewer import build as build_viewer
 
 # The eight loop states of spec 7.9. They are also the values
 # ``research.schema.json`` allows for ``status``, so the persisted status is the
@@ -1913,6 +1914,10 @@ def _build_parser():
         "--apply", dest="apply_path", metavar="<results.json>",
         help="宿主回填结果的 JSON 对象文件",
     )
+    parser.add_argument(
+        "--build-viewer", dest="build_viewer", action="store_true",
+        help="把研究项目生成为静态 HTML 查看器（<项目>/viewer/）",
+    )
     return parser
 
 
@@ -1922,11 +1927,25 @@ def _dispatch(parser, args):
 
     if args.check_env:
         if (args.root or args.round_no is not None or args.actions
-                or args.sources or args.apply_path):
+                or args.sources or args.apply_path or args.build_viewer):
             parser.error(
-                "--check-env 不能与 --root/--round/--actions/--sources/--apply 同时使用"
+                "--check-env 不能与 --root/--round/--actions/--sources/"
+                "--apply/--build-viewer 同时使用"
             )
         return _run_check_env(host_available=not args.no_host)
+
+    if args.build_viewer:
+        if (args.round_no is not None or args.actions or args.sources
+                or args.apply_path):
+            parser.error(
+                "--build-viewer 不能与 --round/--actions/--sources/--apply "
+                "同时使用"
+            )
+        if not args.root:
+            parser.error("--build-viewer 需要 --root")
+        index = build_viewer(Path(args.root))
+        _print_json({"index": str(index)})
+        return 0
 
     if args.apply_path:
         if args.round_no is not None or args.actions or args.sources:
@@ -1949,7 +1968,7 @@ def _dispatch(parser, args):
             Path(args.sources) if args.sources else None,
         )
 
-    parser.error("必须指定 --check-env、--round 或 --apply 之一")
+    parser.error("必须指定 --check-env、--round、--apply 或 --build-viewer 之一")
 
 
 def _run_check_env(host_available=True):

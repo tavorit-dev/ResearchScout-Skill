@@ -231,6 +231,19 @@ PY
 `export_all` 生成 `documents/documents.csv` 与中文 Markdown 报告
 `reports/research-report.md`。建议每轮产生成果后就导出，不必等整个研究结束。
 
+8. 生成静态 HTML 查看器（可随时重复执行）：
+
+```bash
+python3 scripts/research_loop.py --root archive/industry/example-topic \
+  --build-viewer
+```
+
+输出在 `archive/industry/example-topic/viewer/`，可直接用浏览器打开
+`index.html`。页面包含研究总览、报告、发现、可筛选的文档列表、每篇文档的详情、
+来源与合规状态、迭代历史。查看器只读取归档，不联网、不改写任何记录；文档正文
+未保存时只展示元数据、已保存摘要和原文链接。报告页读取最近一次导出的
+`reports/research-report.md`，先执行第 7 步再生成查看器可保证内容最新。
+
 ## 首次运行会看到什么
 
 - **候选清单**：`provider="llm"` 的候选全部是 `discovery_verified: false`、
@@ -339,6 +352,9 @@ PY
 │       ├── sanitize.py
 │       ├── urlnorm.py
 │       └── validate.py
+├── templates/
+│   ├── app.js
+│   └── styles.css
 └── tests/
     ├── __init__.py
     ├── fixtures/
@@ -349,20 +365,21 @@ PY
 - `scripts/research_loop.py` 是唯一的命令行入口；`planner`、
   `source_discovery`、`compliance_gate`、`exporter` 都是模块函数，没有 CLI，
   调用方式见 `SKILL.md`。
-- `scripts/viewer.py` 是 Phase 5 占位，调用时抛出 `NotImplementedError`。
+- `scripts/viewer.py` 生成静态 HTML 查看器；通过
+  `research_loop.py --build-viewer` 调用，输出到 `<项目>/viewer/`。
+- `templates/` 存放查看器的样式与筛选脚本，所有项目共用一份。
 - `archive/` 在首次运行后生成，已在 `.gitignore` 中忽略。
 
 ## v1 范围与未实现项
 
 已实现：合规采集与来源登记、分类归档、研究循环（行动准入、预算、去重、发现合并、
-研究记忆）、Markdown 与 CSV 导出、不可信内容隔离，以及 `REVIEW_REQUIRED` 的用户
-授权登记（`archive/registry/source_policies.jsonl`，带范围与有效期）。断点恢复
-限于状态与归档文件：`state/` 与归档可恢复，但 v1 不提供自动跨轮续跑。
+研究记忆）、Markdown 与 CSV 导出、静态 HTML 查看器、不可信内容隔离，以及
+`REVIEW_REQUIRED` 的用户授权登记（`archive/registry/source_policies.jsonl`，带
+范围与有效期）。断点恢复限于状态与归档文件：`state/` 与归档可恢复，但 v1 不提供
+自动跨轮续跑。
 
 未实现或不在 v1 范围：
 
-- 静态 HTML 查看器（Phase 5）：`scripts/viewer.py` 只是占位；仓库中没有
-  `templates/` 或 `viewer/` 目录。
 - 第三方搜索 provider：只有接口。
 - 向量数据库、语义检索、嵌入、知识图谱、多 Agent 编排、常驻 Web 服务。
 - 语义近似去重只报告疑似对，不自动合并；它借助本轮 `document_texts` 的临时文本
