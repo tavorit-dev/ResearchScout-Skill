@@ -1,25 +1,75 @@
-# Research Scout
+# Wanxiang · 万象
 
-Research Scout is a Skill for iterative information collection and knowledge
-retention in industry research. It turns one research topic into a resumable,
-traceable local knowledge archive: discover candidate sources, check each one
-for compliance, collect and deduplicate, let the LLM host extract findings and
-evidence, update the archive every round, and finally export Markdown, CSV and
-a static HTML viewer.
+Wanxiang (万象) is an information research and knowledge-discovery Skill for the
+open information environment. Around a research objective it covers retrieval,
+investigation, verification, analysis, curation and monitoring, and produces
+research results that are evidence-backed, traceable and continuously
+updatable.
 
-It is not a general-purpose crawler and not a long-running service. It uses no
-database, no vector search and no multi-agent orchestration. It consists of two
-parts:
+It is not a general-purpose crawler, and it is not a resident service. It has
+two parts:
 
-- `SKILL.md`: the driving protocol the LLM host reads.
+- `SKILL.md`: the driving protocol for an LLM host.
 - `scripts/`: deterministic Python scripts that own HTTP requests and pacing,
-  robots.txt parsing, source state, URL normalisation, content hashing and
+  robots.txt parsing, source state, URL normalisation, content hashing,
   deduplication, schema validation, file writes, collection budgets and stop
   conditions.
 
-The scripts never call an LLM and never read an API key. Relevance judgement,
-structured summaries, cross-document synthesis and the next direction all
-belong to the host.
+The scripts never call a model and never read an API key. Relevance judgement,
+structured summaries, cross-document synthesis and the next direction belong to
+the host.
+
+> **Name note:** the product is Wanxiang (万象); the repository and the installed
+> Skill id are still `research-scout`. The compliance transport token
+> `ResearchScout/0.1` is also unchanged in this version. Renaming requires a
+> separate, deliberate migration.
+>
+> **Architecture note:** this file describes the currently runnable v1. The
+> target architecture, module boundaries, target directory and roadmap are in
+> [`docs/architecture.md`](docs/architecture.md).
+
+## Positioning
+
+Wanxiang is not a simple search tool, and not merely a web crawler. It is a
+question-driven information research and knowledge-discovery Skill. Its core
+capabilities are:
+
+| Capability | Question it answers | Main output |
+| --- | --- | --- |
+| Information retrieval | Find information | Candidate sources, candidate documents, search results |
+| Deep research | Understand a topic | Sub-questions, research memory, research report |
+| Verification | Decide whether information is trustworthy | Evidence, contradiction records, confidence marks |
+| Analysis | Extract claims, patterns and relationships | Findings, comparison tables, timelines |
+| Curation | Make results reusable | Categorised archive, JSONL, CSV, Markdown |
+| Monitoring | Detect long-term change | Snapshots, change summaries, research suggestions |
+
+### Four working modes
+
+The four modes are entry points into one Skill, not four separate Skills.
+
+| Mode | Goal | v1 status |
+| --- | --- | --- |
+| Quick lookup | Answer a well-bounded question quickly | Partial; no third-party search backend |
+| Deep research | Study a topic systematically | Implemented |
+| Comparison | Compare several objects on shared dimensions | Not implemented |
+| Monitoring | Track long-term change in a topic | Not implemented |
+
+The mode that runs end to end today is **deep research**: discover candidate
+sources, check each one for compliance, collect and deduplicate, let the LLM host
+extract findings and evidence, update the archive each round, and finally export
+Markdown, CSV and static HTML.
+
+### Division of labour with other Skills
+
+| Skill | Core responsibility | Main output |
+| --- | --- | --- |
+| Wanxiang | Information retrieval, research, analysis, knowledge discovery | Research reports, knowledge base |
+| Gewu | Learning, understanding, interpretation and breakdown | Study notes, principle diagrams |
+| Guanxiang | Weather-data interpretation and decision support | Weather judgement, decision basis |
+| Tiangong | Writing, content organisation and expression | Articles, documents, visual content |
+
+Wanxiang acquires and researches information; Gewu builds understanding;
+Tiangong organises and expresses it.
 
 ## Prerequisites
 
@@ -28,18 +78,17 @@ belong to the host.
 - Python 3. The scripts use the standard library plus two third-party
   dependencies: `jsonschema` for schema validation and `PyYAML` for reading
   `config/*.yaml`.
-- Run every command from the Skill root.
-- After installing the dependencies, confirm readiness with
+- All commands run from the Skill root.
+- After installing the dependencies, check readiness with
   `python3 scripts/research_loop.py --check-env`. It prints the Python version
-  and dependency status and writes no files. In a hostless environment use
+  and dependency status and writes no files. In a hostless environment run
   `python3 scripts/research_loop.py --check-env --no-host`: the report states
-  that the Skill cannot run on its own and exits non-zero, still writing
-  nothing.
+  that the Skill cannot run on its own and exits non-zero, still writing nothing.
 
 ## Installation
 
 1. Clone or copy this repository to `~/.claude/skills/research-scout/` (use your
-   own repository address).
+   own repository URL).
 2. Create a virtual environment (recommended, not required) and install the
    dependencies:
 
@@ -59,12 +108,13 @@ The scripts do not call a model service and do not need an API key.
 
 ## Quick Start (10 minutes)
 
-The example below runs one minimal research round. **Every address, title and
-piece of text is constructed**: `e.org` is a reserved domain, not a real crawl
-result, and it may not resolve. Replace it with real sources you have confirmed
-yourself. If step 4 produces an empty `sources.json`, steps 5-7 yield an empty
-round and an empty export; that is expected. This section gives complete,
-runnable steps; `SKILL.md` wins on any conflict.
+The walkthrough below runs one round of a minimal project. **Every address,
+title and text here is constructed example data**: `e.org` is a reserved domain,
+not a real crawl result, and may not resolve. Replace it with a real source you
+have verified yourself. If step 4 produces an empty `sources.json`, steps 5-7
+produce an empty round and empty exports; that is expected. This section is
+fully executable; where it conflicts with "First run" in `SKILL.md`, `SKILL.md`
+wins.
 
 0. Check the environment:
 
@@ -112,16 +162,16 @@ print(json.dumps(candidates, ensure_ascii=False, indent=2))
 PY
 ```
 
-Candidates from `provider="llm"` come from model knowledge and are all marked
-`discovery_verified: false`. They may make a real request only after the user
-confirms them.
+`provider="llm"` candidates come from model knowledge and are all marked
+`discovery_verified: false`; they require user confirmation before any real
+request.
 
-3. Confirm the scope. The snippet below writes `core` / `related` / `excluded` to
-   `research.yaml` and writes `{"confirmed": true, "lists": {...}}` to
+3. Confirm the scope. The snippet writes `core` / `related` / `excluded` to
+   `research.yaml` and `{"confirmed": true, "lists": {...}}` to
    `state/scope.json`. An unconfirmed scope refuses every **proposed action**
    (`rejected_as: "unconfirmed_scope"`); when every proposed action is refused,
    the round collects nothing. A sources-only round with no proposed actions
-   still collects the confirmed sources after passing the compliance gate.
+   still collects confirmed sources after passing the compliance gate.
 
 ```bash
 python3 - <<'PY'
@@ -151,13 +201,13 @@ PY
 ```
 
 4. Confirm sources and check reachability. After the user confirms which
-   candidates may be read, write their `source_id` values to
+   candidates may be read, record their `source_id` values in
    `confirmed-sources.json`. The file is an array of source ids, for example
-   `["src_xxxxxxxx"]` (a constructed example; replace it with the real
-   `source_id` values from `candidates.json` that you confirmed). The snippet
-   below probes those candidates only: an unconfirmed candidate is never
-   probed, verified or collected. Reachability only says whether an address
-   answers; it is not a permission decision.
+   `["src_xxxxxxxx"]` (constructed example; replace it with the real
+   `source_id` values from `candidates.json`). The snippet probes only those
+   confirmed candidates: an unconfirmed candidate is never probed, verified or
+   collected. Reachability answers only whether the address responds; it is not
+   a permission decision.
 
 ```bash
 python3 - <<'PY'
@@ -192,14 +242,14 @@ print("unreachable confirmed sources:", unreachable)
 PY
 ```
 
-Reachability only says whether the address answers; it is not a permission
-decision. A refusal (401/403/4xx) is `BLOCKED`; a timeout or 5xx is
-`UNREACHABLE`; neither is permission. The round's gate still decides every
-`REVIEW_REQUIRED` source in `sources.json`; after an explicit user
-authorisation, record it with the scoped, expiring policy shown in "Compliance
+Reachability answers only whether the address responds; it is not permission. A
+refusal (401/403/4xx) is `BLOCKED`; a timeout or 5xx is `UNREACHABLE`; neither is
+permission. The compliance gate inside the round still decides whether each
+`REVIEW_REQUIRED` source in `sources.json` may be collected; after explicit user
+authorisation, record it with a scope and expiry as shown in "Compliance
 Statement".
 
-5. Run the round. The compliance gate runs inside the round; the host never
+5. Run one round. The compliance gate runs inside the round; the host never
    marks a source `ALLOWED` itself:
 
 ```bash
@@ -207,12 +257,11 @@ python3 scripts/research_loop.py --root archive/industry/example-topic \
   --round 1 --sources sources.json
 ```
 
-`sources.json` is the array of confirmed sources produced in step 4. The output
-is a machine-readable JSON handoff carrying this round's new documents and the
+`sources.json` is the confirmed source array from step 4. The output is a
+machine-readable JSON handoff containing this round's new documents and the
 remaining budget.
 
-6. After the host completes the semantic work, backfill the result and persist
-   it:
+6. After the host completes the semantic work, backfill the result and persist:
 
 ```bash
 python3 scripts/research_loop.py --root archive/industry/example-topic \
@@ -221,9 +270,9 @@ python3 scripts/research_loop.py --root archive/industry/example-topic \
 
 `results.json` must contain
 `{handoff, observations, findings, next_actions, decision}`. Put the handoff
-printed in step 5 verbatim into the `handoff` field; the minimal shape is below
-(empty values for the other keys are enough to let the round run, while real
-research should fill in the host's observations and findings):
+printed in step 5 into the `handoff` field unchanged. The minimal shape below
+lets the round pass (real research should fill in the host's observations and
+findings):
 
 ```text
 {
@@ -235,9 +284,9 @@ research should fill in the host's observations and findings):
 }
 ```
 
-`decision` must be one of the eight terminal loop states; see "Handoff and
-backfill shapes" in `SKILL.md` for the full shape. Rounds must be applied in
-order; re-applying the same round is allowed as a retry.
+`decision` must be one of the eight terminal loop states; the full shape is in
+"Handoff and backfill shapes" in `SKILL.md`. Rounds must be applied in order;
+re-applying the same round is an allowed retry.
 
 7. Export:
 
@@ -253,8 +302,8 @@ PY
 ```
 
 `export_all` writes `documents/documents.csv` and the Chinese Markdown report
-`reports/research-report.md`. Export after any round that produced work; there
-is no need to wait for the whole research to finish.
+`reports/research-report.md`. Export after any round that produced work; do not
+wait for the whole research task to finish.
 
 8. Build the static HTML viewer (repeatable at any time):
 
@@ -263,92 +312,100 @@ python3 scripts/research_loop.py --root archive/industry/example-topic \
   --build-viewer
 ```
 
-The output is written to `archive/industry/example-topic/viewer/`; open
-`index.html` in a browser. It contains the research overview, report, findings,
-a filterable document list, one page per document, sources and compliance
-status, and the iteration history. The viewer only reads the archive: it opens
-no socket and modifies no record. When a document body was not retained, the
-page shows metadata, the saved summary and a link to the original address. The
-report page reads the last exported `reports/research-report.md`, so run step 7
-first when the report should reflect the newest round.
+The output is written to `archive/industry/example-topic/viewer/` and
+`index.html` opens directly in a browser. The pages contain the research
+overview, report, findings, a filterable document list, each document's detail,
+source and compliance status, and iteration history. The viewer only reads the
+archive: it opens no socket and modifies no record. When a document body was not
+retained, it shows metadata, the saved summary and a link to the original
+address. The report page reads the most recently exported
+`reports/research-report.md`, so run step 7 first when the report should reflect
+the newest round.
 
 ## What the First Run Shows
 
-- **Candidate list**: every `provider="llm"` candidate has
+- **Candidate list**: every `provider="llm"` candidate is
   `discovery_verified: false` and `discovery_method: "llm"`, meaning it comes
   from model knowledge and is unverified. Unconfirmed candidates appear only in
-  this round's handoff `candidates_for_review`; a schema-valid unconfirmed
-  candidate is also written as a review record to
-  `sources/selected_sources.jsonl`, but none of them are ever collected.
+  the round handoff's `candidates_for_review`; candidates that pass schema
+  validation are also written to `sources/selected_sources.jsonl` as review
+  records, but none enters collection.
 - **Reachability check**: one request per user-confirmed candidate to see
-  whether the address answers. It is not collection, and it is not permission.
-- **Round handoff**: `new_documents` (metadata only), `document_texts` (the new
-  documents' body or summary, for this round's analysis only, never persisted),
-  `document_warnings` (prompt-injection phrases found in the text, advisory
-  only), `state_summary`, `remaining_budget`, `actions_rejected`,
+  whether the address responds. This is not collection and not permission.
+- **Round handoff**: `new_documents` (metadata only), `document_texts` (the body
+  or summary of this round's new documents, for this round's analysis only, never
+  persisted), `document_warnings` (prompt-injection phrases found in the text,
+  advisory only), `state_summary`, `remaining_budget`, `actions_rejected`,
   `actions_accepted`, `semantic_candidates` and `budget_exhausted`. Semantic
-  near-duplicate pairs are reported only; no document is removed on that
-  ground.
-- **Archive contents**: metadata and a content fingerprint only
-  (`retention_mode: "reference"`); the full text is not stored.
-- **Injection warnings are only a hint**: a hit means the text contains a
-  phrase commonly used to redirect an agent; it is not proof of an attack (a
-  security article may quote one), and it never blocks, rewrites or re-fetches
-  a document.
-- **Limitations**: v1 stores no full text, so cross-round analysis relies on
-  the current round's `document_texts` or on reading the source again; the
-  marker list is deliberately conservative, so a miss proves nothing; an
-  unknown date stays null and is never guessed.
+  near-duplicates are reported only; no document is deleted.
+- **Archived content**: metadata and a content fingerprint only
+  (`retention_mode: "reference"`); the full body is not stored.
+- **Prompt-injection warnings are only warnings**: a hit means the text contains
+  a phrase often used to redirect an agent. It is not proof of an attack (a
+  security article may quote one), and it never blocks, rewrites or re-fetches a
+  document.
+- **Limitations**: v1 does not store full text, so cross-round analysis relies on
+  this round's `document_texts` or on re-reading the source. The marker list is
+  conservative; a miss proves nothing. Unknown dates stay empty and are never
+  guessed.
 
 ## Compliance Statement
 
-- The compliance statuses here are product states, not a legal permission
-  finding. `ALLOWED` only means the checks this tool performs found nothing
-  prohibiting collection; it is not authorisation, a licence or legal advice.
+- The compliance status in this project is a product state, not a legal
+  determination. `ALLOWED` means only that the checks this tool performs found
+  no rule prohibiting collection; it is not an authorisation, licence or legal
+  opinion.
 - The statuses must stay distinct: `ALLOWED`, `BLOCKED`, `REVIEW_REQUIRED`,
   `ERROR`, `UNREACHABLE`, `DISCOVERED`, `CHECKING`. `BLOCKED` means a rule
-  forbids collection, or the source refused the reachability request (401, 403
-  or another 4xx). `ERROR` (for example an unreadable robots.txt) and
-  `UNREACHABLE` (timeout, network failure or 5xx) both pause the source and
-  never mean allowed.
-- robots.txt is evaluated as this client's product token, `ResearchScout`
-  (the transport User-Agent is `ResearchScout/0.1`), not only as `*`: a rule
-  written for `ResearchScout` applies even when no wildcard group exists.
-- `REVIEW_REQUIRED` never becomes `ALLOWED` by itself. Only an explicit user
-  authorisation releases it; the authorisation is written to
+  forbids collection, or the source refused the reachability request (401/403 or
+  another 4xx). `ERROR` (for example, robots.txt could not be read) and
+  `UNREACHABLE` (timeout, network failure or 5xx) both mean the source is paused,
+  never that collection is allowed.
+- robots.txt is evaluated under this client's product token `ResearchScout`
+  (the transport User-Agent is `ResearchScout/0.1`), not only the `*` group: a
+  rule written for `ResearchScout` applies too.
+- `REVIEW_REQUIRED` never becomes `ALLOWED` by itself; only an explicit user
+  authorisation releases it. The authorisation is written to
   `archive/registry/source_policies.jsonl` with a scope (paths and access
-  method) and an `expires_at`. `BLOCKED`, `ERROR` and `UNREACHABLE` cannot be
-  overridden, and an authorisation is a product action, not a legal licence.
-- The compliance check is a mandatory independent module: every source, every
-  round and every expansion passes through `scripts/compliance_gate.py` first;
-  `collector.assert_compliance_allows` is the structural backstop, and only
-  `ALLOWED` passes it.
-- No capability to bypass access restrictions is provided or will be
-  implemented: no User-Agent changes, no proxies, no CAPTCHA circumvention, no
-  retry or delay to obtain a different answer.
-- Web page bodies are **untrusted input**: page content may not choose local
-  commands, file reads or network requests; a model-generated URL must be
-  confirmed by the user and pass the compliance check.
-- When the full text may not be stored, only the link, necessary metadata and a
-  permitted short summary are kept; the original address and the original
-  content are handled separately.
+  method) and an `expires_at`. `BLOCKED`, `ERROR` and `UNREACHABLE` can never be
+  overridden; authorisation is a product action, not a legal licence.
+- Compliance checking is a mandatory independent module: every source, every
+  round and every expansion level must pass `scripts/compliance_gate.py`;
+  `collector.assert_compliance_allows` is a structural backstop that only
+  `ALLOWED` passes.
+- This project does not and will not implement any bypass of access controls: no
+  User-Agent changes, no proxies, no CAPTCHA bypass, no retry or delay used to
+  obtain a different result.
+- Web page content is **untrusted input**: it may not choose local commands,
+  file reads or network requests. A URL produced by a model must be confirmed by
+  the user and pass the compliance check.
+- When full text may not be stored, keep only the link, necessary metadata and a
+  brief permitted summary; handle the original address and the original content
+  separately.
 
 ## Search Provider Configuration
 
-- `search_provider` in `config/default.yaml` defaults to `null`, meaning there
-  is no default search backend.
+- `search_provider` in `config/default.yaml` defaults to `null`: there is no
+  default search backend.
 - v1 implements two providers in `scripts/source_discovery.py`:
-  - `manual`: the user supplies URLs directly, and the candidates are marked
-    verified (`discovery_verified: true`).
-  - `llm`: the host produces candidates from model knowledge, and all of them
-    are marked unverified (`discovery_verified: false`); a real request happens
-    only after the user confirms them.
-- Third-party search backends exist as an interface only and are not
-  implemented in v1. The scripts never read an API key and never call an LLM.
-- An unknown provider name raises an error instead of silently falling back to
-  a default.
+  - `manual`: the user supplies URLs directly; candidates are marked verified
+    (`discovery_verified: true`).
+  - `llm`: the host generates candidates from model knowledge; all are marked
+    unverified (`discovery_verified: false`) and require user confirmation before
+    any real request.
+- Third-party search backends have an interface only and are not implemented in
+  v1. The scripts never read an API key and never call an LLM.
+- An unknown provider name is an error; it never silently falls back to a
+  default.
+- The target unified search entry `scripts/search.py` is not implemented; its
+  design is in chapter 6 of `docs/architecture.md`.
 
 ## Directory Layout
+
+The tree below is the repository as it exists today. The target layout
+(including `search.py`, `analyzer.py`, `verifier.py`, `tracker.py`,
+`indexer.py`, the SQLite index and the workspace viewer) is in chapter 11 of
+`docs/architecture.md`; **target modules not listed below do not exist yet**.
 
 ```text
 .
@@ -363,7 +420,9 @@ first when the report should reflect the newest round.
 │   ├── iteration.yaml
 │   └── scoring.yaml
 ├── docs/
+│   ├── architecture.md
 │   ├── prd-init.md
+│   ├── prd-new.md
 │   ├── prd-refactor.md
 │   └── superpowers/
 ├── schemas/
@@ -409,61 +468,75 @@ first when the report should reflect the newest round.
     └── test_*.py
 ```
 
-- `SKILL.md` is the host entry point; `CLAUDE.md` holds the repository's
-  development guidance.
-- `scripts/research_loop.py` is the only command-line entry point; `planner`,
-  `source_discovery`, `compliance_gate` and `exporter` are module functions with
-  no CLI. See `SKILL.md` for how to call them.
-- `scripts/viewer.py` builds the static HTML viewer; it is invoked by
-  `research_loop.py --build-viewer` and writes `<project>/viewer/`.
-- `templates/` holds the viewer's stylesheet and filter script, shared by every
+- `SKILL.md` is the host entry point; `CLAUDE.md` is the in-repository
+  development guide.
+- `scripts/research_loop.py` is the only command-line entry. `planner`,
+  `source_discovery`, `compliance_gate` and `exporter` are Python modules with no
+  CLI; their call shapes are in `SKILL.md`.
+- `scripts/viewer.py` builds the static HTML viewer; it is called through
+  `research_loop.py --build-viewer` and writes to `<project>/viewer/`.
+- `templates/` holds the viewer's styles and filter script, shared by every
   project.
 - `archive/` is created on first run and is ignored by `.gitignore`.
 
+## Current Support by Mode
+
+| Capability | v1 status | Notes |
+| --- | --- | --- |
+| Quick lookup | Partial | Can obtain and verify candidates, but there is no multi-source search backend; the host writes the full answer |
+| Deep research | Implemented | Multi-round research, compliant collection, findings, report, HTML viewer |
+| Comparison | Not implemented | No structured shared-dimension records or comparison table |
+| Monitoring | Not implemented | No snapshots, change summaries or incremental diff |
+
 ## v1 Scope and Not Implemented
 
-Implemented: compliance-first collection and source registry, classified
-archiving, the research loop (action admission, budgets, deduplication, finding
-merges, research memory), Markdown and CSV export, the static HTML viewer,
-untrusted-content isolation, and the `REVIEW_REQUIRED` user authorisation
-registry
-(`archive/registry/source_policies.jsonl`, with scope and expiry). Resume is
-limited to state and archive files: `state/` and the archive can be resumed,
-but v1 does not provide automatic cross-run resume.
+Implemented: compliance-first collection and source registration, categorised
+archiving, the research loop (action admission, budget, deduplication, finding
+merge, research memory), Markdown and CSV export, the static HTML viewer,
+untrusted-content isolation, and the user-authorisation record for
+`REVIEW_REQUIRED` (`archive/registry/source_policies.jsonl`, with scope and
+expiry). Resume support is limited to state and archive files: `state/` and the
+archive can be recovered, but v1 does not provide automatic cross-round
+continuation.
 
-Not implemented or out of scope for v1:
+Not implemented or out of v1 scope:
 
 - Third-party search providers: interface only.
+- Unified search entry `scripts/search.py`, analysis `scripts/analyzer.py`,
+  verification `scripts/verifier.py`, tracking `scripts/tracker.py` and the
+  SQLite index `scripts/indexer.py`: all unimplemented and part of the target
+  architecture.
+- Comparison (`comparisons/`) and monitoring (`tracking/`): unimplemented.
+- The cross-project source registry `archive/registry/sources.jsonl` and the
+  workspace viewer `archive/viewer/`: unimplemented.
 - Vector databases, semantic retrieval, embeddings, knowledge graphs,
-  multi-agent orchestration and long-running web services.
+  multi-agent orchestration and a resident web service.
 - Semantic near-duplicate detection reports suspected pairs only and never
-  merges them; it compares the round's transient `document_texts`, which are
-  never persisted.
-- The document state machine is partial: statuses advance only to `FETCHED` /
-  `EXTRACTED` / `PERSISTED` as the pipeline actually sets them;
-  `attempt_count` stays 0 for successful documents; permanent-failure retry and
-  next-round priority are not implemented, so the report's "permanent failure"
-  subsection is never populated in v1.
-- There is no automatic retry: a 5xx or 429 is a failed fetch for that round,
-  and a robots.txt failure is `ERROR` and is never retried. This is a
-  deliberate deviation from spec 10.4's bounded-retry bullet.
-- The API/feed terms dimension is absent: an rss or api source without a
-  declared terms URL is evaluated by robots.txt only.
+  merges them; it compares this round's temporary `document_texts`, and the text
+  itself is not persisted.
+- The document state machine is partial: a document advances only through the
+  states the pipeline actually sets, `FETCHED` / `EXTRACTED` / `PERSISTED`;
+  `attempt_count` stays 0 for successful documents. Permanent-failure retry and
+  next-round priority are unimplemented, and the report's "permanent failure"
+  subsection is always empty in v1.
+- There is no automatic retry: a 5xx or 429 is a failed fetch for that round; a
+  robots.txt failure is `ERROR` and is never retried. This is a deliberate
+  deviation from spec 10.4's bounded-retry bullet.
+- The API/feed terms and quota dimension is absent: an rss or api source without
+  a declared terms URL is evaluated by robots.txt only.
 - `document_weights` in `config/scoring.yaml` is defined but no v1 script
-  consumes it; the finding weights `finding_weights` are used by
-  `scripts/reflection.py`.
-- Inert config keys: `max_attempts` and the branch/no-progress knobs
-  `max_branch_depth`, `max_active_branches`, `min_new_information_ratio` and
-  `stop_when_no_progress_rounds` are defined in `config/iteration.yaml`, but no
+  consumes it; `finding_weights` is used by `scripts/reflection.py`.
+- Lazy configuration: `max_attempts`, and `max_branch_depth`,
+  `max_active_branches`, `min_new_information_ratio` and
+  `stop_when_no_progress_rounds` in `config/iteration.yaml`, are defined but no
   v1 script reads or enforces them.
-- There is no module that computes document-level relevance, freshness or
-  authority scores automatically; the related schema fields exist, but v1 does
-  not fill them.
+- There is no automatic document relevance/freshness scoring module; the schema
+  fields exist but v1 leaves them unfilled.
 - `compliance_recheck_days` is used: a recorded compliance decision older than
-  the configured interval (30 days by default) is checked again; a missing or
-  malformed timestamp is re-checked as well.
+  this period (30 days by default) is re-checked; a missing or unparsable
+  timestamp also triggers a re-check.
 - Browser rendering and JavaScript pages are not handled; collection reads only
-  the static content of an HTTP response.
+  the static HTTP response.
 
 ## Tests
 
@@ -471,20 +544,23 @@ Not implemented or out of scope for v1:
 python3 -m unittest discover -s tests -v
 ```
 
-The tests do not use the network: HTTP runs through injected fetchers and
-fixtures; compliance, deduplication, URL normalisation and other deterministic
-logic each have their own tests.
+The tests do not use the network: HTTP is provided through an injected fetcher
+and fixtures; compliance, deduplication and URL normalisation all have
+independent tests.
 
 ## Further Documentation
 
-- `SKILL.md`: host protocol, the six-step loop, First run, states and
-  boundaries.
-- `docs/prd-refactor.md`, `docs/prd-init.md`: design records; when they
-  conflict, `prd-refactor.md` wins.
-- `CLAUDE.md`: repository development conventions.
+- [`docs/architecture.md`](docs/architecture.md): target architecture, module
+  boundaries, target directory, roadmap and the v1 gap.
+- `SKILL.md`: host protocol, the six-step loop, first run, states and boundaries.
+- `docs/prd-new.md`: product positioning, six capabilities, four modes and the
+  MVP roadmap.
+- `docs/prd-refactor.md`, `docs/prd-init.md`: historical design records. For
+  engineering structure, `docs/architecture.md` wins.
+- `CLAUDE.md`: in-repository development conventions.
 
 ## Licence
 
-This repository currently has no `LICENSE` file and no open-source licence has
-been chosen. Until the repository owner adds a `LICENSE`, no licence is granted
-and all rights are reserved. Contact the repository owner if you wish to use it.
+This repository currently has no `LICENSE` file and no chosen open-source
+licence. Until the repository owner adds a `LICENSE`, no licence is granted and
+all rights are reserved. Contact the repository owner if you need to use it.

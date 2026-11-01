@@ -4,21 +4,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目性质
 
-这是一个**面向行业研究的迭代式信息采集与知识沉淀 Skill**，不是通用爬虫，也不是
-独立后台服务。
+这是**万象（Wanxiang）**，一个面向开放信息环境的信息研究与知识发现 Skill，不是
+通用爬虫，也不是独立后台服务。产品名是「万象 / Wanxiang」；仓库名与 Skill id
+仍为 `research-scout`，改名需要一次独立、有意的迁移（见 `docs/architecture.md`
+第十五章）。
 
 - 第一版形态：`SKILL.md` + Python 脚本 + 本地文件归档，由 Claude Code 等能调用
   本地命令的 AI 编码工具使用。
 - 不引入独立数据库服务器、多 Agent 编排、知识图谱、向量数据库或常驻 Web 服务。
+  SQLite 只允许作为可重建的本地派生索引，不是事实来源，也不是服务。
 - 不实现任何绕过访问限制的能力（更换 User-Agent、代理、验证码绕过）。
 - v1 代码已在 `scripts/` 落地；实际目录结构与脚本命名以 `README.md` 的
-  「目录结构」一节为准。`docs/prd-refactor.md` 第六章是设计记录，其中
-  `relevance_ranker` 尚未实现。
+  「目录结构」一节为准，目标结构见 `docs/architecture.md` 第十一章。
+  `relevance_ranker` 及架构文档中的目标模块尚未实现。
 
-`docs/` 下的两份文档是设计记录，不是规范：`prd-init.md` 是最初的「分阶段爬虫」
-方案，`prd-refactor.md` 是对它的修订，改为 ReAct 式研究循环 + 主题约束 + 分类
-归档 + 静态 HTML 查看器。**两者冲突时以 `prd-refactor.md` 为准。** 不要在没有
-要求时修改它们。
+`docs/` 下的文档分工如下：
+
+- `prd-new.md`：产品愿景与能力边界，是产品意图来源。
+- `architecture.md`：**工程结构的唯一权威**，定义目标架构、模块边界、目标目录
+  与演进路线。
+- `prd-init.md` / `prd-refactor.md`：历史设计记录。`prd-init.md` 是最初的
+  「分阶段爬虫」方案，`prd-refactor.md` 是 ReAct 式研究循环 + 主题约束 + 分类
+  归档 + 静态 HTML 查看器的修订。
+
+冲突时：产品定位看 `prd-new.md`，工程结构看 `architecture.md`。不要在没有要求时
+修改 `prd-init.md`、`prd-refactor.md`、`prd-new.md`；`architecture.md` 随架构
+决策更新，但不得把未实现的能力写成已实现。
 
 ## 语言约定
 
@@ -44,27 +55,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 核心架构
 
-三层：**Skill 编排层（`SKILL.md`）+ 确定性执行脚本（`scripts/`）+ 可选 LLM 分析层**。
+架构分六层：**Skill 编排层（`SKILL.md`）、检索与采集层、分析与核验层、研究
+控制层、归档与索引层、展示层**。完整分层与数据流见 `docs/architecture.md`
+第三章。
 
 不要把逻辑都交给大模型。确定性脚本负责 HTTP 请求与限速、robots.txt 解析、来源
 状态管理、URL 规范化、内容哈希与去重、Schema 校验、文件写入、采集预算与终止条件。
 LLM 只负责语义相关性判断、结构化摘要、跨文档综合与后续方向提出。
 
-系统划分为五个部分（`docs/prd-refactor.md` 第一章）：
+系统划分为六个子系统（`docs/architecture.md` 第三章）：
 
-1. **Research Planner** — 确定主题、目标、范围和约束。
+1. **Research Planner** — 确定主题、目标、子问题、范围和预算。
 2. **Research Loop** — 每轮 Action → Observation → Evidence Extraction →
    Reflection → Next Action → Persist。
 3. **Compliance & Collection** — 来源检查、采集、正文提取、清洗、去重、评分。
-4. **Knowledge Archive** — 按研究主题分类归档、去重、检索。
-5. **HTML Viewer** — 构建时生成的静态页面，无常驻服务。
+4. **Analysis & Verification** — 语义分析、事实核验、冲突识别、对比与时间线。
+   v1 尚未拆成独立模块，语义工作由宿主完成。
+5. **Knowledge Archive & Index** — 按研究主题分类归档、去重、跨项目检索；
+   SQLite 是目标中的派生索引，不是事实来源。
+6. **HTML Viewer** — 构建时生成的静态页面，无常驻服务；v1 只有单项目查看器，
+   工作区查看器是目标。
 
 ### 数据流
 
 ```text
-创建研究项目 → 定义目标与范围 → 发现信息源 → 合规检查与来源选择
-    → Research Loop（多轮，每轮产出研究记忆与下一步行动）
-    → 更新本地知识库 → 生成 Markdown / CSV → 生成静态 HTML
+选择工作模式（quick / deep / comparison / monitor）
+    → 创建研究项目 → 定义目标、子问题、范围与预算
+    → 检索候选 → 发现信息源 → 用户确认 → 合规检查与来源选择
+    → Research Loop（多轮：Action → Observation → Evidence → Reflection
+      → Next Action → Persist）
+    → 分析 / 核验（目标：analyzer、verifier）
+    → 更新本地知识库与派生索引（目标：SQLite）
+    → 生成 Markdown / CSV → 生成静态 HTML（单项目；目标：工作区）
 ```
 
 每轮结束后立即更新页面与数据，不要等整个研究任务终止。任务因预算耗尽或程序退出
@@ -72,16 +94,16 @@ LLM 只负责语义相关性判断、结构化摘要、跨文档综合与后续�
 
 ### 目录结构
 
-`docs/prd-refactor.md` 第六章是设计记录；v1 实际结构摘要如下，以 `README.md`
-的「目录结构」一节为准：
+`docs/architecture.md` 第十一章是目标目录结构；`README.md` 的「目录结构」一节
+是当前实际结构。下表是 v1 实际结构摘要：
 
 | 路径 | 职责 |
 | --- | --- |
 | `SKILL.md` | 入口、工作流、通用强约束、状态选择、文件索引 |
 | `config/` | `default.yaml`、`scoring.yaml`、`iteration.yaml` |
-| `scripts/` | `action_gate` / `archive` / `collector` / `compliance_gate` / `content_extractor` / `deduplicator` / `exporter` / `planner` / `reflection` / `research_loop` / `source_discovery` / `viewer`（静态 HTML 生成）与 `lib/` |
-| `schemas/` | `research` / `source` / `document` / `finding` / `action` 五份 JSON Schema |
-| `archive/registry/` | v1 未实现（实际来源登记是每个项目的 `sources/selected_sources.jsonl`） |
+| `scripts/` | `action_gate` / `archive` / `collector` / `compliance_gate` / `content_extractor` / `deduplicator` / `exporter` / `planner` / `reflection` / `research_loop` / `source_discovery` / `viewer`（静态 HTML 生成）与 `lib/`；目标新增 `search` / `analyzer` / `verifier` / `tracker` / `indexer`（尚未实现） |
+| `schemas/` | `research` / `source` / `document` / `finding` / `action` 五份 JSON Schema；目标新增 `comparison` / `tracking` |
+| `archive/registry/` | v1 只有人工授权记录 `source_policies.jsonl`；跨项目来源注册表 `sources.jsonl` 与派生索引 `archive/index/wanxiang.sqlite3` 是目标，尚未实现。实际来源登记在每个项目的 `sources/selected_sources.jsonl` |
 | `archive/<领域>/<主题>/` | 单个研究项目的全部数据（见下） |
 | `templates/` | 静态 HTML 查看器的样式与筛选脚本；生成的 `viewer/` 位于各研究项目内 |
 
@@ -123,11 +145,33 @@ LLM 只负责语义相关性判断、结构化摘要、跨文档综合与后续�
     日期未知时留空并记录来源与置信度，不让模型猜日期。
 12. 终止条件优先于继续运行：没有新的可靠证据、也没有值得执行的下一步行动时停止，
     不为了继续运行而继续采集。
+13. **SQLite 是派生索引。** 它可以由 JSONL / Markdown 重建，不是事实来源；写索引
+    失败不破坏归档，任何写操作先落归档再更新索引。
+14. **核验不改变合规状态。** 核验需要新来源时，仍然重新走信息源发现、用户确认与
+    合规检查；不得以「只是核验」为由绕过合规闸门。
 
 面向读者的设计原则（合规优先、来源优先、近期优先、结构化优先、增量优先、研究
 驱动、可追溯）展开在 `docs/prd-init.md` 第 1.2 节；修改时不要在两处重复展开。
 
 ## 关键机制
+
+### 四种工作模式
+
+快速检索、专题调研、对比分析、持续追踪是同一个 Skill 的四个任务入口，不是四个
+独立 Skill。各模式的流程、产物与 v1 支持程度见 `docs/architecture.md` 第四章。
+v1 只有专题调研完整可用；另外三种模式在实现前不得写成已支持。
+
+### 分析与核验
+
+- **Analyzer**：从文档中提取主张、实体、对比维度、时间线与候选发现，全部带
+  `document_id`。
+- **Verifier**：处理重要但低置信度、相互矛盾或只有单一来源支持的结论，维护
+  核验队列，更新 `confidence` 与冲突记录。
+- 分析回答「材料说了什么」，核验回答「说法是否可信」，反思回答「下一步做
+  什么」。三者的产物分开存储。
+- 核验不改变来源的合规状态；核验需要新来源时，仍然重新走发现、确认与合规检查。
+
+v1 尚未实现独立模块，语义工作由宿主直接完成。
 
 ### 研究循环的六个步骤
 
@@ -166,17 +210,21 @@ URL 规范化去重 → 内容指纹去重 → 语义近似去重。语义近似
 
 ## 实现顺序
 
+以 `docs/architecture.md` 第十三章的 P0–P6 为准：
+
 | 阶段 | 重点 | 交付物 |
 | --- | --- | --- |
-| Phase 1 | 合规采集与结构化归档 | 可运行的基础 Skill |
-| Phase 2 | 研究循环与高权重摘要 | ReAct 式研究引擎 |
-| Phase 3 | 主题约束与预算控制 | 可控的多轮研究 |
-| Phase 4 | 分类目录与本地检索 | 多主题知识库 |
-| Phase 5 | 静态 HTML 查看器 | 可浏览的研究界面 |
-| Phase 6 | 增量采集与研究恢复 | 可长期使用的研究工具 |
+| P0 | 文档与契约收敛 | 架构文档、README、目录约定 |
+| P1 | 统一检索入口 | `search.py`、provider 接口、结果规范化 |
+| P2 | 语义分析与对比 | `analyzer.py`、对比 Schema、`comparisons/` |
+| P3 | 核验 | `verifier.py`、核验队列、冲突记录 |
+| P4 | 持续追踪 | `tracker.py`、`tracking/` 快照与变化 |
+| P5 | 索引与工作区查看器 | `indexer.py`、SQLite 派生索引、`archive/viewer/` |
+| P6 | 稳定性增强 | 有限重试、跨轮续跑、增量采集、评分落地 |
 
-Phase 1～3 是核心能力，4～5 是知识管理与展示，6 是稳定性增强。不要跳过 Phase 1
-直接做后续阶段。
+P1–P4 是核心研究能力，P5 是知识管理与展示，P6 是稳定性增强。不要跳过 P1 直接做
+后续阶段；任何阶段都不得放宽合规闸门。v1 已落地的模块保持现有行为，新增能力以
+叠加方式接入，不重命名已写入 `SKILL.md` 与测试的模块。
 
 ## 常见命令
 
@@ -218,4 +266,7 @@ Python 标准库优先；引入第三方依赖需在 `requirements.txt` 中声�
 - 不要在示例、fixture 或文档中把构造数据写成真实抓取结果。
 - 不要为每个研究主题复制一整套 Skill；Skill 和采集引擎只有一份。
 - 不要把历次摘要全部拼接后交给模型，按三层结构合并。
-- 不要在没有明确要求时修改 `docs/` 下的两份 PRD。
+- 不要把目标架构中尚未实现的模块（`search` / `analyzer` / `verifier` /
+  `tracker` / `indexer`、SQLite 索引、工作区查看器）写成已实现或已存在。
+- 不要在没有明确要求时修改 `docs/prd-init.md`、`docs/prd-refactor.md`、
+  `docs/prd-new.md`；`architecture.md` 随架构决策更新，但必须与实现状态一致。

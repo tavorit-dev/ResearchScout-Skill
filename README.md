@@ -1,12 +1,10 @@
-# Research Scout
+# 万象 · Wanxiang
 
-Research Scout（研究侦察员）是一个面向行业研究的迭代式信息采集与知识沉淀 Skill。
-它把一个研究主题变成可断点续跑、可追溯的本地知识库：发现候选来源、逐个做合规
-检查、采集并去重，由 LLM 宿主抽取发现与证据，每轮更新归档，最后导出 Markdown
-与 CSV。
+万象（Wanxiang）是一个面向开放信息环境的信息研究与知识发现 Skill。它围绕一个
+研究目标，完成检索、调研、核验、分析、沉淀与追踪，产出有依据、可追溯、可持续
+更新的研究成果。
 
-它不是通用爬虫，也不是常驻服务，没有数据库、向量检索或多 Agent 编排。它由两部分
-组成：
+它不是通用爬虫，也不是常驻服务。它由两部分组成：
 
 - `SKILL.md`：给 LLM 宿主的驱动协议。
 - `scripts/`：确定性的 Python 脚本，负责 HTTP 请求与限速、robots.txt 解析、来源
@@ -14,6 +12,52 @@ Research Scout（研究侦察员）是一个面向行业研究的迭代式信息
 
 脚本自身不调用任何 LLM，也不读取 API Key；相关性判断、结构化摘要、跨文档综合与
 下一步方向全部由宿主完成。
+
+> **名称说明：** 产品名是「万象 / Wanxiang」，仓库名与已安装的 Skill id 目前仍为
+> `research-scout`。合规传输标识 `ResearchScout/0.1` 也在本版本保留，改名需要一次
+> 独立、有意的迁移。
+>
+> **架构说明：** 本文描述当前可运行的 v1。目标架构、模块边界、目标目录与演进路线
+> 见 [`docs/architecture.md`](docs/architecture.md)。
+
+## 产品定位
+
+万象不是简单的搜索工具，也不只是网页爬虫，而是一个面向问题的信息研究与知识
+发现 Skill。核心能力包括：
+
+| 能力 | 解决的问题 | 主要产出 |
+| --- | --- | --- |
+| 信息检索 | 找到信息 | 候选来源、候选文档、检索结果 |
+| 专题调研 | 理解一个主题 | 子问题、研究记忆、研究报告 |
+| 信息核验 | 判断信息是否可信 | 证据、冲突记录、可信度标记 |
+| 信息分析 | 提取观点、规律与关系 | 发现、对比表、时间线 |
+| 知识沉淀 | 让成果可复用 | 分类归档、JSONL、CSV、Markdown |
+| 持续追踪 | 发现长期变化 | 快照、变化摘要、研究建议 |
+
+### 四种工作模式
+
+四种模式是同一个 Skill 的不同任务入口，不是四个独立 Skill。
+
+| 模式 | 目标 | v1 状态 |
+| --- | --- | --- |
+| 快速检索 | 快速回答一个边界明确的问题 | 部分支持；没有第三方搜索后端 |
+| 专题调研 | 系统研究一个主题 | 已实现 |
+| 对比分析 | 对多个对象做统一维度比较 | 未实现 |
+| 持续追踪 | 关注一个主题的长期变化 | 未实现 |
+
+当前可完整跑通的是**专题调研**：发现候选来源、逐个做合规检查、采集并去重，由
+LLM 宿主抽取发现与证据，每轮更新归档，最后导出 Markdown、CSV 与静态 HTML。
+
+### 与现有 Skill 的分工
+
+| Skill | 核心职责 | 主要产出 |
+| --- | --- | --- |
+| 万象 Wanxiang | 信息检索、调研、分析、知识发现 | 研究报告、资料库 |
+| 格物 Gewu | 学习、理解、解读、拆解 | 学习笔记、原理图解 |
+| 观象 Guanxiang | 天气数据解读与辅助决策 | 天气判断、决策依据 |
+| 天工 Tiangong | 写作辅助、内容组织与表达 | 文章、文档、图文内容 |
+
+万象负责获取和研究信息，格物负责深入理解知识，天工负责组织和表达内容。
 
 ## 前置条件
 
@@ -299,8 +343,14 @@ python3 scripts/research_loop.py --root archive/industry/example-topic \
     （`discovery_verified: false`），用户确认后才做真实请求。
 - 第三方搜索后端只有接口，v1 未实现。脚本不会读取 API Key，也不会调用任何 LLM。
 - 未知 provider 名会报错，而不是静默回退到某个默认值。
+- 目标架构中的统一检索入口 `scripts/search.py` 尚未实现，设计见
+  `docs/architecture.md` 第六章。
 
 ## 目录结构
+
+以下为当前仓库的实际结构。目标结构（含 `search.py`、`analyzer.py`、
+`verifier.py`、`tracker.py`、`indexer.py`、SQLite 索引与工作区查看器）见
+`docs/architecture.md` 第十一章；**未列在下面的目标模块目前并不存在**。
 
 ```text
 .
@@ -315,7 +365,9 @@ python3 scripts/research_loop.py --root archive/industry/example-topic \
 │   ├── iteration.yaml
 │   └── scoring.yaml
 ├── docs/
+│   ├── architecture.md
 │   ├── prd-init.md
+│   ├── prd-new.md
 │   ├── prd-refactor.md
 │   └── superpowers/
 ├── schemas/
@@ -370,6 +422,15 @@ python3 scripts/research_loop.py --root archive/industry/example-topic \
 - `templates/` 存放查看器的样式与筛选脚本，所有项目共用一份。
 - `archive/` 在首次运行后生成，已在 `.gitignore` 中忽略。
 
+## 四种模式的当前能力
+
+| 能力 | v1 状态 | 说明 |
+| --- | --- | --- |
+| 快速检索 | 部分 | 可获取候选并核验，但没有多源搜索后端；完整答案由宿主生成 |
+| 专题调研 | 已实现 | 多轮研究、合规采集、发现、报告、HTML 查看器 |
+| 对比分析 | 未实现 | 没有统一维度的结构化记录与对比表 |
+| 持续追踪 | 未实现 | 没有快照、变化摘要与增量对比 |
+
 ## v1 范围与未实现项
 
 已实现：合规采集与来源登记、分类归档、研究循环（行动准入、预算、去重、发现合并、
@@ -381,6 +442,12 @@ python3 scripts/research_loop.py --root archive/industry/example-topic \
 未实现或不在 v1 范围：
 
 - 第三方搜索 provider：只有接口。
+- 统一检索入口 `scripts/search.py`、分析 `scripts/analyzer.py`、核验
+  `scripts/verifier.py`、追踪 `scripts/tracker.py`、SQLite 索引
+  `scripts/indexer.py`：均未实现，属于目标架构。
+- 对比分析（`comparisons/`）与持续追踪（`tracking/`）：未实现。
+- 跨项目来源注册表 `archive/registry/sources.jsonl` 与工作区查看器
+  `archive/viewer/`：未实现。
 - 向量数据库、语义检索、嵌入、知识图谱、多 Agent 编排、常驻 Web 服务。
 - 语义近似去重只报告疑似对，不自动合并；它借助本轮 `document_texts` 的临时文本
   参与比较，文本本身不持久化。
@@ -412,9 +479,12 @@ python3 -m unittest discover -s tests -v
 
 ## 更多文档
 
+- [`docs/architecture.md`](docs/architecture.md)：目标架构、模块边界、目标目录、
+  演进路线与 v1 差距。
 - `SKILL.md`：宿主协议、六步循环、First run、状态与边界。
-- `docs/prd-refactor.md`、`docs/prd-init.md`：设计记录，两者冲突时以
-  `prd-refactor.md` 为准。
+- `docs/prd-new.md`：产品定位、六项能力、四种模式与 MVP 路线。
+- `docs/prd-refactor.md`、`docs/prd-init.md`：历史设计记录。工程结构以
+  `docs/architecture.md` 为准。
 - `CLAUDE.md`：仓库开发约定。
 
 ## 许可
