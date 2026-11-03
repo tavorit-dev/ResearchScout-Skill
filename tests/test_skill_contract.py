@@ -12,6 +12,15 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 SKILL = REPO / "SKILL.md"
 SCRIPTS = REPO / "scripts"
+SKILLS = REPO / ".claude" / "skills"
+
+# The four work-mode entry points, mapped to whether v1 implements them.
+ENTRY_POINTS = {
+    "wanxiang-quick": False,
+    "wanxiang-deep": True,
+    "wanxiang-comparison": False,
+    "wanxiang-monitor": False,
+}
 
 # The six steps of one research round, in order.
 SIX_STEPS = ("Action", "Observation", "Evidence", "Reflection",
@@ -85,6 +94,48 @@ class TestSkillContract(unittest.TestCase):
             any("--sources" in block for block in round_blocks),
             "the documented round command must show --sources",
         )
+
+
+class TestWorkModeEntryPoints(unittest.TestCase):
+    """The four /wanxiang-* commands are entry points, not four engines."""
+
+    def entry_text(self, name):
+        path = SKILLS / name / "SKILL.md"
+        self.assertTrue(path.is_file(), f"missing skill entry point: {name}")
+        return path.read_text(encoding="utf-8")
+
+    def test_all_four_entry_points_exist(self):
+        for name in ENTRY_POINTS:
+            self.entry_text(name)
+
+    def test_each_entry_point_declares_its_own_name(self):
+        for name in ENTRY_POINTS:
+            self.assertIn(f"name: {name}\n", self.entry_text(name))
+
+    def test_deep_entry_point_is_the_canonical_protocol(self):
+        deep = (SKILLS / "wanxiang-deep" / "SKILL.md").resolve()
+        self.assertEqual(deep, SKILL.resolve())
+        self.assertIn("name: wanxiang-deep\n", SKILL.read_text(encoding="utf-8"))
+
+    def test_unimplemented_entry_points_say_so_and_redirect_to_deep(self):
+        for name, implemented in ENTRY_POINTS.items():
+            if implemented:
+                continue
+            text = self.entry_text(name)
+            self.assertIn("not implemented", text.lower(), name)
+            self.assertIn("/wanxiang-deep", text, name)
+
+    def test_unimplemented_entry_points_forbid_doing_work(self):
+        for name, implemented in ENTRY_POINTS.items():
+            if implemented:
+                continue
+            text = self.entry_text(name)
+            self.assertIn("do not", text.lower(), name)
+            self.assertIn("collect", text.lower(), name)
+            self.assertIn("archive", text.lower(), name)
+
+    def test_old_research_scout_entry_point_is_gone(self):
+        self.assertFalse((SKILLS / "research-scout").exists())
 
 
 if __name__ == "__main__":

@@ -19,10 +19,12 @@ The scripts never call a model and never read an API key. Relevance judgement,
 structured summaries, cross-document synthesis and the next direction belong to
 the host.
 
-> **Name note:** the product is Wanxiang (万象); the repository and the installed
-> Skill id are still `research-scout`. The compliance transport token
-> `ResearchScout/0.1` is also unchanged in this version. Renaming requires a
-> separate, deliberate migration.
+> **Name note:** the product is Wanxiang (万象). The four entry commands are
+> `/wanxiang-quick`, `/wanxiang-deep`, `/wanxiang-comparison` and
+> `/wanxiang-monitor`; only `/wanxiang-deep` is fully implemented in v1, and the
+> other three state that they are not implemented and point to deep. The
+> repository name is still `research-scout`, and the compliance transport token
+> `ResearchScout/0.1` is deliberately unchanged.
 >
 > **Architecture note:** this file describes the currently runnable v1. The
 > target architecture, module boundaries, target directory and roadmap are in
@@ -47,17 +49,17 @@ capabilities are:
 
 The four modes are entry points into one Skill, not four separate Skills.
 
-| Mode | Goal | v1 status |
-| --- | --- | --- |
-| Quick lookup | Answer a well-bounded question quickly | Partial; no third-party search backend |
-| Deep research | Study a topic systematically | Implemented |
-| Comparison | Compare several objects on shared dimensions | Not implemented |
-| Monitoring | Track long-term change in a topic | Not implemented |
+| Mode | Entry command | Goal | v1 status |
+| --- | --- | --- | --- |
+| Quick lookup | `/wanxiang-quick` | Answer a well-bounded question quickly | Not implemented; the entry point points to deep |
+| Deep research | `/wanxiang-deep` | Study a topic systematically | Implemented |
+| Comparison | `/wanxiang-comparison` | Compare several objects on shared dimensions | Not implemented; the entry point points to deep |
+| Monitoring | `/wanxiang-monitor` | Track long-term change in a topic | Not implemented; the entry point points to deep |
 
-The mode that runs end to end today is **deep research**: discover candidate
-sources, check each one for compliance, collect and deduplicate, let the LLM host
-extract findings and evidence, update the archive each round, and finally export
-Markdown, CSV and static HTML.
+The mode that runs end to end today is **deep research** (`/wanxiang-deep`):
+discover candidate sources, check each one for compliance, collect and
+deduplicate, let the LLM host extract findings and evidence, update the archive
+each round, and finally export Markdown, CSV and static HTML.
 
 ### Division of labour with other Skills
 
@@ -87,8 +89,23 @@ Tiangong organises and expresses it.
 
 ## Installation
 
-1. Clone or copy this repository to `~/.claude/skills/research-scout/` (use your
-   own repository URL).
+1. Clone this repository to `~/.claude/skills/wanxiang-deep/` (use your own
+   repository URL), then link the other three entry points:
+
+```bash
+git clone <your-repo-url> ~/.claude/skills/wanxiang-deep
+for mode in quick comparison monitor; do
+  ln -s "wanxiang-deep/.claude/skills/wanxiang-$mode" \
+    "$HOME/.claude/skills/wanxiang-$mode"
+done
+```
+
+The repository's own `.claude/skills/` already contains all four entry points,
+so no extra setup is needed when developing inside the repository; the commands
+above are for a global install. `/wanxiang-quick`, `/wanxiang-comparison` and
+`/wanxiang-monitor` are not-implemented entry points and contain no separate
+engine.
+
 2. Create a virtual environment (recommended, not required) and install the
    dependencies:
 
@@ -409,6 +426,12 @@ The tree below is the repository as it exists today. The target layout
 
 ```text
 .
+├── .claude/
+│   └── skills/
+│       ├── wanxiang-comparison/SKILL.md
+│       ├── wanxiang-deep -> ../..
+│       ├── wanxiang-monitor/SKILL.md
+│       └── wanxiang-quick/SKILL.md
 ├── .gitignore
 ├── SKILL.md
 ├── CLAUDE.md
@@ -481,12 +504,12 @@ The tree below is the repository as it exists today. The target layout
 
 ## Current Support by Mode
 
-| Capability | v1 status | Notes |
-| --- | --- | --- |
-| Quick lookup | Partial | Can obtain and verify candidates, but there is no multi-source search backend; the host writes the full answer |
-| Deep research | Implemented | Multi-round research, compliant collection, findings, report, HTML viewer |
-| Comparison | Not implemented | No structured shared-dimension records or comparison table |
-| Monitoring | Not implemented | No snapshots, change summaries or incremental diff |
+| Capability | Entry command | v1 status | Notes |
+| --- | --- | --- | --- |
+| Quick lookup | `/wanxiang-quick` | Not implemented | The entry point points to `/wanxiang-deep`; deep can answer a narrow question with a smaller scope |
+| Deep research | `/wanxiang-deep` | Implemented | Multi-round research, compliant collection, findings, report, HTML viewer |
+| Comparison | `/wanxiang-comparison` | Not implemented | No structured shared-dimension records or comparison table |
+| Monitoring | `/wanxiang-monitor` | Not implemented | No snapshots, change summaries or incremental diff |
 
 ## v1 Scope and Not Implemented
 

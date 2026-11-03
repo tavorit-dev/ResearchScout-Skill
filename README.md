@@ -13,9 +13,10 @@
 脚本自身不调用任何 LLM，也不读取 API Key；相关性判断、结构化摘要、跨文档综合与
 下一步方向全部由宿主完成。
 
-> **名称说明：** 产品名是「万象 / Wanxiang」，仓库名与已安装的 Skill id 目前仍为
-> `research-scout`。合规传输标识 `ResearchScout/0.1` 也在本版本保留，改名需要一次
-> 独立、有意的迁移。
+> **名称说明：** 产品名是「万象 / Wanxiang」。四个入口命令是 `/wanxiang-quick`、
+> `/wanxiang-deep`、`/wanxiang-comparison`、`/wanxiang-monitor`；v1 只有
+> `/wanxiang-deep` 完整可用，另外三个入口会明确提示未实现并引导到 deep。仓库名
+> 仍为 `research-scout`，合规传输标识 `ResearchScout/0.1` 有意保留不变。
 >
 > **架构说明：** 本文描述当前可运行的 v1。目标架构、模块边界、目标目录与演进路线
 > 见 [`docs/architecture.md`](docs/architecture.md)。
@@ -38,15 +39,16 @@
 
 四种模式是同一个 Skill 的不同任务入口，不是四个独立 Skill。
 
-| 模式 | 目标 | v1 状态 |
-| --- | --- | --- |
-| 快速检索 | 快速回答一个边界明确的问题 | 部分支持；没有第三方搜索后端 |
-| 专题调研 | 系统研究一个主题 | 已实现 |
-| 对比分析 | 对多个对象做统一维度比较 | 未实现 |
-| 持续追踪 | 关注一个主题的长期变化 | 未实现 |
+| 模式 | 入口命令 | 目标 | v1 状态 |
+| --- | --- | --- | --- |
+| 快速检索 | `/wanxiang-quick` | 快速回答一个边界明确的问题 | 未实现；入口提示并引导到 deep |
+| 专题调研 | `/wanxiang-deep` | 系统研究一个主题 | 已实现 |
+| 对比分析 | `/wanxiang-comparison` | 对多个对象做统一维度比较 | 未实现；入口提示并引导到 deep |
+| 持续追踪 | `/wanxiang-monitor` | 关注一个主题的长期变化 | 未实现；入口提示并引导到 deep |
 
-当前可完整跑通的是**专题调研**：发现候选来源、逐个做合规检查、采集并去重，由
-LLM 宿主抽取发现与证据，每轮更新归档，最后导出 Markdown、CSV 与静态 HTML。
+当前可完整跑通的是**专题调研**（`/wanxiang-deep`）：发现候选来源、逐个做合规
+检查、采集并去重，由 LLM 宿主抽取发现与证据，每轮更新归档，最后导出 Markdown、
+CSV 与静态 HTML。
 
 ### 与现有 Skill 的分工
 
@@ -73,8 +75,21 @@ LLM 宿主抽取发现与证据，每轮更新归档，最后导出 Markdown、C
 
 ## 安装
 
-1. 把本仓库克隆或复制到 `~/.claude/skills/research-scout/`（使用你自己的仓库
-   地址）。
+1. 把本仓库克隆到 `~/.claude/skills/wanxiang-deep/`（使用你自己的仓库地址），
+   再为另外三个入口建立软链接：
+
+```bash
+git clone <your-repo-url> ~/.claude/skills/wanxiang-deep
+for mode in quick comparison monitor; do
+  ln -s "wanxiang-deep/.claude/skills/wanxiang-$mode" \
+    "$HOME/.claude/skills/wanxiang-$mode"
+done
+```
+
+仓库根的 `.claude/skills/` 已包含这四个入口，在仓库内开发时无需额外配置；上面
+命令是给全局安装用的。`/wanxiang-quick`、`/wanxiang-comparison`、
+`/wanxiang-monitor` 是未实现提示入口，不包含独立引擎。
+
 2. 建立虚拟环境（推荐，不强制）并安装依赖：
 
 ```bash
@@ -354,6 +369,12 @@ python3 scripts/research_loop.py --root archive/industry/example-topic \
 
 ```text
 .
+├── .claude/
+│   └── skills/
+│       ├── wanxiang-comparison/SKILL.md
+│       ├── wanxiang-deep -> ../..
+│       ├── wanxiang-monitor/SKILL.md
+│       └── wanxiang-quick/SKILL.md
 ├── .gitignore
 ├── SKILL.md
 ├── CLAUDE.md
@@ -424,12 +445,12 @@ python3 scripts/research_loop.py --root archive/industry/example-topic \
 
 ## 四种模式的当前能力
 
-| 能力 | v1 状态 | 说明 |
-| --- | --- | --- |
-| 快速检索 | 部分 | 可获取候选并核验，但没有多源搜索后端；完整答案由宿主生成 |
-| 专题调研 | 已实现 | 多轮研究、合规采集、发现、报告、HTML 查看器 |
-| 对比分析 | 未实现 | 没有统一维度的结构化记录与对比表 |
-| 持续追踪 | 未实现 | 没有快照、变化摘要与增量对比 |
+| 能力 | 入口命令 | v1 状态 | 说明 |
+| --- | --- | --- | --- |
+| 快速检索 | `/wanxiang-quick` | 未实现 | 入口只提示未实现并引导到 `/wanxiang-deep`；deep 可用更小范围回答窄问题 |
+| 专题调研 | `/wanxiang-deep` | 已实现 | 多轮研究、合规采集、发现、报告、HTML 查看器 |
+| 对比分析 | `/wanxiang-comparison` | 未实现 | 没有统一维度的结构化记录与对比表 |
+| 持续追踪 | `/wanxiang-monitor` | 未实现 | 没有快照、变化摘要与增量对比 |
 
 ## v1 范围与未实现项
 

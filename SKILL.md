@@ -1,11 +1,15 @@
 ---
-name: research-scout
-description: Compliance-first iterative research with a local knowledge archive. Use when the user asks for industry research, technical due diligence, competitor analysis, or ongoing trend tracking that must discover sources, check them for compliance, read them, and keep traceable findings.
+name: wanxiang-deep
+description: Use when the user asks for systematic research of a topic, such as industry research, technical due diligence, or competitor analysis, that must discover sources, check compliance, read them, and keep traceable findings.
 ---
 
-# Research Scout
+# Wanxiang Deep Research
 
-Research Scout is a driving protocol, not a standalone service. An LLM host (any
+This is the Deep Research entry point of Wanxiang. The other work-mode
+entry points (`/wanxiang-quick`, `/wanxiang-comparison`, `/wanxiang-monitor`)
+exist as commands but are not implemented in v1.
+
+Wanxiang is a driving protocol, not a standalone service. An LLM host (any
 agent that can read this file and run local commands) makes every semantic
 decision: what matters, what a document says, what the findings are, and what to
 do next. The Python scripts do the mechanical work and never call a model.

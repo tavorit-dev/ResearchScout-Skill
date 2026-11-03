@@ -5,9 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 项目性质
 
 这是**万象（Wanxiang）**，一个面向开放信息环境的信息研究与知识发现 Skill，不是
-通用爬虫，也不是独立后台服务。产品名是「万象 / Wanxiang」；仓库名与 Skill id
-仍为 `research-scout`，改名需要一次独立、有意的迁移（见 `docs/architecture.md`
-第十五章）。
+通用爬虫，也不是独立后台服务。产品名是「万象 / Wanxiang」；仓库名仍为
+`research-scout`。四个入口命令是 `/wanxiang-quick`、`/wanxiang-deep`、
+`/wanxiang-comparison`、`/wanxiang-monitor`，v1 只有 `/wanxiang-deep` 完整可用；
+其余三个入口只提示未实现并引导到 deep（见 `docs/architecture.md` 第十五章）。
 
 - 第一版形态：`SKILL.md` + Python 脚本 + 本地文件归档，由 Claude Code 等能调用
   本地命令的 AI 编码工具使用。
@@ -99,7 +100,8 @@ LLM 只负责语义相关性判断、结构化摘要、跨文档综合与后续�
 
 | 路径 | 职责 |
 | --- | --- |
-| `SKILL.md` | 入口、工作流、通用强约束、状态选择、文件索引 |
+| `SKILL.md` | 入口、工作流、通用强约束、状态选择、文件索引；即 `/wanxiang-deep` 入口 |
+| `.claude/skills/` | `wanxiang-deep`（软链接到仓库根，唯一完整实现）与 `wanxiang-quick` / `wanxiang-comparison` / `wanxiang-monitor`（未实现提示入口） |
 | `config/` | `default.yaml`、`scoring.yaml`、`iteration.yaml` |
 | `scripts/` | `action_gate` / `archive` / `collector` / `compliance_gate` / `content_extractor` / `deduplicator` / `exporter` / `planner` / `reflection` / `research_loop` / `source_discovery` / `viewer`（静态 HTML 生成）与 `lib/`；目标新增 `search` / `analyzer` / `verifier` / `tracker` / `indexer`（尚未实现） |
 | `schemas/` | `research` / `source` / `document` / `finding` / `action` 五份 JSON Schema；目标新增 `comparison` / `tracking` |
@@ -159,7 +161,9 @@ LLM 只负责语义相关性判断、结构化摘要、跨文档综合与后续�
 
 快速检索、专题调研、对比分析、持续追踪是同一个 Skill 的四个任务入口，不是四个
 独立 Skill。各模式的流程、产物与 v1 支持程度见 `docs/architecture.md` 第四章。
-v1 只有专题调研完整可用；另外三种模式在实现前不得写成已支持。
+v1 只有专题调研完整可用；另外三种模式在实现前不得写成已支持。三个未实现模式已
+提供入口命令（`/wanxiang-quick`、`/wanxiang-comparison`、`/wanxiang-monitor`），
+入口本身只声明未实现并引导到 `/wanxiang-deep`，不代表模式可用。
 
 ### 分析与核验
 
@@ -268,5 +272,7 @@ Python 标准库优先；引入第三方依赖需在 `requirements.txt` 中声�
 - 不要把历次摘要全部拼接后交给模型，按三层结构合并。
 - 不要把目标架构中尚未实现的模块（`search` / `analyzer` / `verifier` /
   `tracker` / `indexer`、SQLite 索引、工作区查看器）写成已实现或已存在。
+- 不要把 `/wanxiang-quick`、`/wanxiang-comparison`、`/wanxiang-monitor` 写成可用
+  模式；它们只是未实现提示入口。
 - 不要在没有明确要求时修改 `docs/prd-init.md`、`docs/prd-refactor.md`、
   `docs/prd-new.md`；`architecture.md` 随架构决策更新，但必须与实现状态一致。

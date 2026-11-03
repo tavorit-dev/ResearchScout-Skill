@@ -44,12 +44,12 @@
 
 四种模式是同一个 Skill 的不同任务入口，不是四个独立 Skill。
 
-| 模式 | 目标 | 是否建立完整研究档案 |
-| --- | --- | --- |
-| 快速检索 Quick | 快速回答一个边界明确的问题 | 否，可选轻量记录 |
-| 专题调研 Deep Research | 系统研究一个主题 | 是 |
-| 对比分析 Comparison | 对多个对象做统一维度比较 | 是，额外产出结构化对比记录 |
-| 持续追踪 Monitoring | 关注一个主题的长期变化 | 是，在既有项目上增量更新 |
+| 模式 | 入口命令 | 目标 | 是否建立完整研究档案 |
+| --- | --- | --- | --- |
+| 快速检索 Quick | `/wanxiang-quick` | 快速回答一个边界明确的问题 | 否，可选轻量记录 |
+| 专题调研 Deep Research | `/wanxiang-deep` | 系统研究一个主题 | 是 |
+| 对比分析 Comparison | `/wanxiang-comparison` | 对多个对象做统一维度比较 | 是，额外产出结构化对比记录 |
+| 持续追踪 Monitoring | `/wanxiang-monitor` | 关注一个主题的长期变化 | 是，在既有项目上增量更新 |
 
 ### 2.3 明确不做
 
@@ -174,12 +174,12 @@
 
 ### 4.5 模式与产物
 
-| 模式 | 规划记录 | 采集 | 归档 | 主要产物 | v1 状态 |
-| --- | --- | --- | --- | --- | --- |
-| Quick | 可选 | 窄范围 | 可选 | 答案 + 引用 | 部分（无搜索后端） |
-| Deep Research | `research.yaml` + `state/scope.json` | 多轮 | 完整 | 报告、发现、HTML | 已实现 |
-| Comparison | 维度写入 `research.yaml` | 多源 | 完整 + `comparisons/` | 对比表、差异分析 | 未实现 |
-| Monitoring | 追踪配置 | 增量 | 快照 + 变化 | 变化摘要、建议 | 未实现 |
+| 模式 | 入口命令 | 规划记录 | 采集 | 归档 | 主要产物 | v1 状态 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Quick | `/wanxiang-quick` | 可选 | 窄范围 | 可选 | 答案 + 引用 | 未实现（入口只提示并引导 deep） |
+| Deep Research | `/wanxiang-deep` | `research.yaml` + `state/scope.json` | 多轮 | 完整 | 报告、发现、HTML | 已实现 |
+| Comparison | `/wanxiang-comparison` | 维度写入 `research.yaml` | 多源 | 完整 + `comparisons/` | 对比表、差异分析 | 未实现（入口只提示并引导 deep） |
+| Monitoring | `/wanxiang-monitor` | 追踪配置 | 增量 | 快照 + 变化 | 变化摘要、建议 | 未实现（入口只提示并引导 deep） |
 
 ## 五、研究引擎
 
@@ -746,9 +746,11 @@ research-scout-skill/                 # 仓库名本轮不变；产品名 万象
 
 以下问题不影响当前文档结构，但在对应阶段开始前需要确认：
 
-1. **产品与 Skill 改名时机。** 对外名称是否从 `research-scout` 迁移到
-   `wanxiang`；这会同时影响 Skill 目录名、`SKILL.md` 的 `name` 字段和合规
-   传输标识 `ResearchScout/0.1`，需要一次有意的迁移，而不是顺手改名。
+1. **产品与 Skill 改名时机（已决策）。** 对外入口已迁移为 `/wanxiang-quick`、
+   `/wanxiang-deep`、`/wanxiang-comparison`、`/wanxiang-monitor` 四个 Skill
+   命令；v1 只有 `/wanxiang-deep` 完整可用，其余三个入口只声明未实现并引导到
+   deep。仓库名仍为 `research-scout`，合规传输标识 `ResearchScout/0.1` 有意
+   保留：它已绑定 robots.txt 分组与既有合规决策，改名会使历史决策失效。
 2. **搜索 provider 的优先级。** 先接官方 API / RSS，还是先接第三方网页搜索
    API；前者合规成本低，后者覆盖面广。
 3. **SQLite FTS 的索引范围。** 是否索引已保存摘要与摘录；默认不索引任何未保存
