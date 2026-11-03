@@ -23,8 +23,9 @@ the host.
 > `/wanxiang-quick`, `/wanxiang-deep`, `/wanxiang-comparison` and
 > `/wanxiang-monitor`; only `/wanxiang-deep` is fully implemented in v1, and the
 > other three state that they are not implemented and point to deep. The
-> repository name is still `research-scout`, and the compliance transport token
-> `ResearchScout/0.1` is deliberately unchanged.
+> repository is `ResearchScout-Skill` (local directory `research-scout-skill`),
+> and the compliance transport token `ResearchScout/0.1` is deliberately
+> unchanged.
 >
 > **Architecture note:** this file describes the currently runnable v1. The
 > target architecture, module boundaries, target directory and roadmap are in

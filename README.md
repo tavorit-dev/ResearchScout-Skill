@@ -16,7 +16,8 @@
 > **名称说明：** 产品名是「万象 / Wanxiang」。四个入口命令是 `/wanxiang-quick`、
 > `/wanxiang-deep`、`/wanxiang-comparison`、`/wanxiang-monitor`；v1 只有
 > `/wanxiang-deep` 完整可用，另外三个入口会明确提示未实现并引导到 deep。仓库名
-> 仍为 `research-scout`，合规传输标识 `ResearchScout/0.1` 有意保留不变。
+> 为 `ResearchScout-Skill`（本地目录 `research-scout-skill`），合规传输标识
+> `ResearchScout/0.1` 有意保留不变。
 >
 > **架构说明：** 本文描述当前可运行的 v1。目标架构、模块边界、目标目录与演进路线
 > 见 [`docs/architecture.md`](docs/architecture.md)。

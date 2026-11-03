@@ -5,8 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 项目性质
 
 这是**万象（Wanxiang）**，一个面向开放信息环境的信息研究与知识发现 Skill，不是
-通用爬虫，也不是独立后台服务。产品名是「万象 / Wanxiang」；仓库名仍为
-`research-scout`。四个入口命令是 `/wanxiang-quick`、`/wanxiang-deep`、
+通用爬虫，也不是独立后台服务。产品名是「万象 / Wanxiang」；仓库名为
+`ResearchScout-Skill`（本地目录 `research-scout-skill`）。四个入口命令是
+`/wanxiang-quick`、`/wanxiang-deep`、
 `/wanxiang-comparison`、`/wanxiang-monitor`，v1 只有 `/wanxiang-deep` 完整可用；
 其余三个入口只提示未实现并引导到 deep（见 `docs/architecture.md` 第十五章）。
 

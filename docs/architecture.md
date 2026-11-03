@@ -580,7 +580,7 @@ finding_id:  find_xxxxxx
 标记说明：`现有` 表示 v1 已存在；`目标` 表示本架构新增或调整。
 
 ```text
-research-scout-skill/                 # 仓库名本轮不变；产品名 万象 / Wanxiang
+research-scout-skill/                 # 仓库名 ResearchScout-Skill；产品名 万象 / Wanxiang
 ├── SKILL.md                          # 现有：宿主运行协议
 ├── CLAUDE.md                         # 现有：仓库开发约定
 ├── README.md                         # 现有：中文入口
@@ -749,8 +749,9 @@ research-scout-skill/                 # 仓库名本轮不变；产品名 万象
 1. **产品与 Skill 改名时机（已决策）。** 对外入口已迁移为 `/wanxiang-quick`、
    `/wanxiang-deep`、`/wanxiang-comparison`、`/wanxiang-monitor` 四个 Skill
    命令；v1 只有 `/wanxiang-deep` 完整可用，其余三个入口只声明未实现并引导到
-   deep。仓库名仍为 `research-scout`，合规传输标识 `ResearchScout/0.1` 有意
-   保留：它已绑定 robots.txt 分组与既有合规决策，改名会使历史决策失效。
+   deep。仓库名为 `ResearchScout-Skill`（本地目录 `research-scout-skill`），
+   合规传输标识 `ResearchScout/0.1` 有意保留：它已绑定 robots.txt 分组与
+   既有合规决策，改名会使历史决策失效。
 2. **搜索 provider 的优先级。** 先接官方 API / RSS，还是先接第三方网页搜索
    API；前者合规成本低，后者覆盖面广。
 3. **SQLite FTS 的索引范围。** 是否索引已保存摘要与摘录；默认不索引任何未保存
